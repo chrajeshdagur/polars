@@ -2,12 +2,12 @@ use std::io::Write;
 
 #[cfg(feature = "async")]
 use futures::AsyncWrite;
-use parquet_format_safe::{ColumnChunk, RowGroup};
+use polars_parquet_format::{ColumnChunk, RowGroup};
 
 use super::column_chunk::write_column_chunk;
 #[cfg(feature = "async")]
 use super::column_chunk::write_column_chunk_async;
-use super::page::{is_data_page, PageWriteSpec};
+use super::page::{PageWriteSpec, is_data_page};
 use super::{DynIter, DynStreamingIterator};
 use crate::parquet::error::{ParquetError, ParquetResult};
 use crate::parquet::metadata::{ColumnChunkMetadata, ColumnDescriptor};

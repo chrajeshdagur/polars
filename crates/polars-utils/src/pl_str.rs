@@ -1,9 +1,13 @@
+use std::borrow::Cow;
+
+use crate::relaxed_cell::RelaxedCell;
+
 #[macro_export]
 macro_rules! format_pl_smallstr {
     ($($arg:tt)*) => {{
         use std::fmt::Write;
 
-        let mut string = PlSmallStr::EMPTY;
+        let mut string = $crate::pl_str::PlSmallStr::EMPTY;
         write!(string, $($arg)*).unwrap();
         string
     }}
@@ -13,8 +17,29 @@ type Inner = compact_str::CompactString;
 
 /// String type that inlines small strings.
 #[derive(Clone, Eq, Hash, PartialOrd, Ord)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(transparent)
+)]
 pub struct PlSmallStr(Inner);
+
+#[cfg(feature = "dsl-schema")]
+impl schemars::JsonSchema for PlSmallStr {
+    fn is_referenceable() -> bool {
+        false
+    }
+
+    fn schema_name() -> std::string::String {
+        String::schema_name()
+    }
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        String::schema_id()
+    }
+    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        String::json_schema(generator)
+    }
+}
 
 impl PlSmallStr {
     pub const EMPTY: Self = Self::from_static("");
@@ -42,6 +67,17 @@ impl PlSmallStr {
     }
 
     #[inline(always)]
+    pub fn as_mut_str(&mut self) -> &mut str {
+        self.0.as_mut_str()
+    }
+
+    #[inline(always)]
+    #[allow(clippy::inherent_to_string_shadow_display)] // This is faster.
+    pub fn to_string(&self) -> String {
+        self.0.as_str().to_owned()
+    }
+
+    #[inline(always)]
     pub fn into_string(self) -> String {
         self.0.into_string()
     }
@@ -54,7 +90,7 @@ impl Default for PlSmallStr {
     }
 }
 
-/// AsRef, Deref and Borrow impls to &str
+// AsRef, Deref and Borrow impls to &str
 
 impl AsRef<str> for PlSmallStr {
     #[inline(always)]
@@ -72,6 +108,13 @@ impl core::ops::Deref for PlSmallStr {
     }
 }
 
+impl core::ops::DerefMut for PlSmallStr {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.as_mut_str()
+    }
+}
+
 impl core::borrow::Borrow<str> for PlSmallStr {
     #[inline(always)]
     fn borrow(&self) -> &str {
@@ -79,7 +122,7 @@ impl core::borrow::Borrow<str> for PlSmallStr {
     }
 }
 
-/// AsRef impls for other types
+// AsRef impls for other types
 
 impl AsRef<std::path::Path> for PlSmallStr {
     #[inline(always)]
@@ -102,7 +145,7 @@ impl AsRef<std::ffi::OsStr> for PlSmallStr {
     }
 }
 
-/// From impls
+// From impls
 
 impl From<&str> for PlSmallStr {
     #[inline(always)]
@@ -115,6 +158,20 @@ impl From<String> for PlSmallStr {
     #[inline(always)]
     fn from(value: String) -> Self {
         Self::from_string(value)
+    }
+}
+
+impl From<PlSmallStr> for String {
+    #[inline(always)]
+    fn from(value: PlSmallStr) -> Self {
+        value.to_string()
+    }
+}
+
+impl From<Cow<'_, str>> for PlSmallStr {
+    #[inline(always)]
+    fn from(value: Cow<str>) -> Self {
+        Self(Inner::from(value))
     }
 }
 
@@ -132,7 +189,7 @@ impl From<Inner> for PlSmallStr {
     }
 }
 
-/// FromIterator impls
+// FromIterator impls
 
 impl FromIterator<PlSmallStr> for PlSmallStr {
     #[inline(always)]
@@ -190,7 +247,7 @@ impl<'a> FromIterator<std::borrow::Cow<'a, str>> for PlSmallStr {
     }
 }
 
-/// PartialEq impls
+// PartialEq impls
 
 impl<T> PartialEq<T> for PlSmallStr
 where
@@ -216,7 +273,7 @@ impl PartialEq<PlSmallStr> for String {
     }
 }
 
-/// Write
+// Write
 
 impl core::fmt::Write for PlSmallStr {
     #[inline(always)]
@@ -235,7 +292,7 @@ impl core::fmt::Write for PlSmallStr {
     }
 }
 
-/// Debug, Display
+// Debug, Display
 
 impl core::fmt::Debug for PlSmallStr {
     #[inline(always)]
@@ -249,4 +306,10 @@ impl core::fmt::Display for PlSmallStr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.as_str().fmt(f)
     }
+}
+
+pub fn unique_column_name() -> PlSmallStr {
+    static COUNTER: RelaxedCell<u64> = RelaxedCell::new_u64(0);
+    let idx = COUNTER.fetch_add(1);
+    format_pl_smallstr!("_POLARS_TMP_{idx}")
 }

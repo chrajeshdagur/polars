@@ -17,13 +17,11 @@ pub fn flatten_df_iter(df: &DataFrame) -> impl Iterator<Item = DataFrame> + '_ {
                 out.set_sorted_flag(s.is_sorted_flag());
                 Column::from(out)
             })
-            .collect();
-        let df = unsafe { DataFrame::new_no_checks(columns) };
-        if df.is_empty() {
-            None
-        } else {
-            Some(df)
-        }
+            .collect::<Vec<_>>();
+
+        let height = DataFrame::infer_height(&columns);
+        let df = unsafe { DataFrame::new_no_checks(height, columns) };
+        if df.is_empty() { None } else { Some(df) }
     })
 }
 

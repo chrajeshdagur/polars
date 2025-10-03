@@ -1,13 +1,15 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use polars_core::prelude::PlHashMap;
 use polars_error::PolarsResult;
 use polars_utils::_limit_path_len_io_err;
 use polars_utils::mmap::MemSlice;
+use polars_utils::plpath::PlPathRef;
 
 use crate::cloud::{
-    build_object_store, object_path_from_str, CloudLocation, CloudOptions, ObjectStorePath,
-    PolarsObjectStore,
+    CloudLocation, CloudOptions, ObjectStorePath, PolarsObjectStore, build_object_store,
+    object_path_from_str,
 };
 
 #[allow(async_fn_in_trait)]
@@ -16,7 +18,11 @@ pub trait ByteSource: Send + Sync {
     /// # Panics
     /// Panics if `range` is not in bounds.
     async fn get_range(&self, range: Range<usize>) -> PolarsResult<MemSlice>;
-    async fn get_ranges(&self, ranges: &[Range<usize>]) -> PolarsResult<Vec<MemSlice>>;
+    /// Note: This will mutably sort ranges for coalescing.
+    async fn get_ranges(
+        &self,
+        ranges: &mut [Range<usize>],
+    ) -> PolarsResult<PlHashMap<usize, MemSlice>>;
 }
 
 /// Byte source backed by a `MemSlice`, which can potentially be memory-mapped.
@@ -24,13 +30,15 @@ pub struct MemSliceByteSource(pub MemSlice);
 
 impl MemSliceByteSource {
     async fn try_new_mmap_from_path(
-        path: &str,
+        path: PlPathRef<'_>,
         _cloud_options: Option<&CloudOptions>,
     ) -> PolarsResult<Self> {
+        let path = path.as_local_path().unwrap();
+
         let file = Arc::new(
             tokio::fs::File::open(path)
                 .await
-                .map_err(|err| _limit_path_len_io_err(path.as_ref(), err))?
+                .map_err(|err| _limit_path_len_io_err(path, err))?
                 .into_std()
                 .await,
         );
@@ -49,11 +57,14 @@ impl ByteSource for MemSliceByteSource {
         Ok(out)
     }
 
-    async fn get_ranges(&self, ranges: &[Range<usize>]) -> PolarsResult<Vec<MemSlice>> {
+    async fn get_ranges(
+        &self,
+        ranges: &mut [Range<usize>],
+    ) -> PolarsResult<PlHashMap<usize, MemSlice>> {
         Ok(ranges
             .iter()
-            .map(|x| self.0.slice(x.clone()))
-            .collect::<Vec<_>>())
+            .map(|x| (x.start, self.0.slice(x.clone())))
+            .collect())
     }
 }
 
@@ -64,13 +75,12 @@ pub struct ObjectStoreByteSource {
 
 impl ObjectStoreByteSource {
     async fn try_new_from_path(
-        path: &str,
+        path: PlPathRef<'_>,
         cloud_options: Option<&CloudOptions>,
     ) -> PolarsResult<Self> {
         let (CloudLocation { prefix, .. }, store) =
             build_object_store(path, cloud_options, false).await?;
         let path = object_path_from_str(&prefix)?;
-        let store = PolarsObjectStore::new(store);
 
         Ok(Self { store, path })
     }
@@ -78,7 +88,7 @@ impl ObjectStoreByteSource {
 
 impl ByteSource for ObjectStoreByteSource {
     async fn get_size(&self) -> PolarsResult<usize> {
-        Ok(self.store.head(&self.path).await?.size)
+        Ok(self.store.head(&self.path).await?.size as usize)
     }
 
     async fn get_range(&self, range: Range<usize>) -> PolarsResult<MemSlice> {
@@ -88,9 +98,11 @@ impl ByteSource for ObjectStoreByteSource {
         Ok(mem_slice)
     }
 
-    async fn get_ranges(&self, ranges: &[Range<usize>]) -> PolarsResult<Vec<MemSlice>> {
-        let ranges = self.store.get_ranges(&self.path, ranges).await?;
-        Ok(ranges.into_iter().map(MemSlice::from_bytes).collect())
+    async fn get_ranges(
+        &self,
+        ranges: &mut [Range<usize>],
+    ) -> PolarsResult<PlHashMap<usize, MemSlice>> {
+        self.store.get_ranges_sort(&self.path, ranges).await
     }
 }
 
@@ -130,7 +142,10 @@ impl ByteSource for DynByteSource {
         }
     }
 
-    async fn get_ranges(&self, ranges: &[Range<usize>]) -> PolarsResult<Vec<MemSlice>> {
+    async fn get_ranges(
+        &self,
+        ranges: &mut [Range<usize>],
+    ) -> PolarsResult<PlHashMap<usize, MemSlice>> {
         match self {
             Self::MemSlice(v) => v.get_ranges(ranges).await,
             Self::Cloud(v) => v.get_ranges(ranges).await,
@@ -166,7 +181,7 @@ pub enum DynByteSourceBuilder {
 impl DynByteSourceBuilder {
     pub async fn try_build_from_path(
         &self,
-        path: &str,
+        path: PlPathRef<'_>,
         cloud_options: Option<&CloudOptions>,
     ) -> PolarsResult<DynByteSource> {
         Ok(match self {

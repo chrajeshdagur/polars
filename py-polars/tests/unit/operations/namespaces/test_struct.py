@@ -3,7 +3,10 @@ from __future__ import annotations
 import datetime
 from collections import OrderedDict
 
+import pytest
+
 import polars as pl
+from polars.exceptions import ColumnNotFoundError, InvalidOperationError
 from polars.testing import assert_frame_equal
 
 
@@ -95,3 +98,36 @@ def test_empty_list_eval_schema_5734() -> None:
     assert df.filter(False).select(
         pl.col("a").list.eval(pl.element().struct.field("b"))
     ).schema == {"a": pl.List(pl.Int64)}
+
+
+def test_field_by_index_18732() -> None:
+    df = pl.DataFrame({"foo": [{"a": 1, "b": 2}, {"a": 2, "b": 1}]})
+
+    # illegal upper bound
+    with pytest.raises(ColumnNotFoundError):
+        df.filter(pl.col.foo.struct[2] == 1)
+
+    # legal
+    expected_df = pl.DataFrame({"foo": [{"a": 1, "b": 2}]})
+    result_df = df.filter(pl.col.foo.struct[0] == 1)
+    assert_frame_equal(expected_df, result_df)
+
+    expected_df = pl.DataFrame({"foo": [{"a": 2, "b": 1}]})
+    result_df = df.filter(pl.col.foo.struct[-1] == 1)
+    assert_frame_equal(expected_df, result_df)
+
+
+def test_unnest_raises_on_non_struct_23654() -> None:
+    df = pl.DataFrame(
+        {
+            "a": [1],
+            "b": [1.1],
+            "c": ["abc"],
+            "d": [True],
+            "e": [datetime.datetime(2025, 1, 1)],
+            "f": [datetime.datetime(2025, 1, 2).date()],
+        }
+    )
+    for z in "abcdef":
+        with pytest.raises(InvalidOperationError):
+            df.unnest(z)

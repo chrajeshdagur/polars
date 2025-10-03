@@ -1,6 +1,6 @@
 /// # Safety
 /// unsafe code downstream relies on the correct is_float call
-pub unsafe trait IsFloat: private::Sealed {
+pub unsafe trait IsFloat: private::Sealed + Sized {
     fn is_float() -> bool {
         false
     }
@@ -11,6 +11,18 @@ pub unsafe trait IsFloat: private::Sealed {
 
     fn is_f64() -> bool {
         false
+    }
+
+    fn nan_value() -> Self {
+        unimplemented!()
+    }
+
+    fn pos_inf_value() -> Self {
+        unimplemented!()
+    }
+
+    fn neg_inf_value() -> Self {
+        unimplemented!()
     }
 
     #[allow(clippy::wrong_self_convention)]
@@ -38,6 +50,8 @@ unsafe impl IsFloat for u8 {}
 unsafe impl IsFloat for u16 {}
 unsafe impl IsFloat for u32 {}
 unsafe impl IsFloat for u64 {}
+unsafe impl IsFloat for u128 {}
+unsafe impl IsFloat for usize {}
 unsafe impl IsFloat for &str {}
 unsafe impl IsFloat for &[u8] {}
 unsafe impl IsFloat for bool {}
@@ -54,6 +68,8 @@ mod private {
     impl Sealed for u16 {}
     impl Sealed for u32 {}
     impl Sealed for u64 {}
+    impl Sealed for u128 {}
+    impl Sealed for usize {}
     impl Sealed for f32 {}
     impl Sealed for f64 {}
     impl Sealed for &str {}
@@ -76,6 +92,18 @@ macro_rules! impl_is_float {
 
             fn is_f64() -> bool {
                 $is_f64
+            }
+
+            fn nan_value() -> Self {
+                Self::NAN
+            }
+
+            fn pos_inf_value() -> Self {
+                Self::INFINITY
+            }
+
+            fn neg_inf_value() -> Self {
+                Self::NEG_INFINITY
             }
 
             #[inline]

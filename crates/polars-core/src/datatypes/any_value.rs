@@ -1,18 +1,13 @@
+#![allow(unsafe_op_in_unsafe_fn)]
 use std::borrow::Cow;
 
-#[cfg(feature = "dtype-struct")]
-use arrow::legacy::trusted_len::TrustedLenPush;
 use arrow::types::PrimitiveType;
-use polars_utils::format_pl_smallstr;
-use polars_utils::itertools::Itertools;
-#[cfg(feature = "dtype-struct")]
-use polars_utils::slice::GetSaferUnchecked;
-#[cfg(feature = "dtype-categorical")]
-use polars_utils::sync::SyncPtr;
+use polars_compute::cast::SerPrimitive;
+use polars_error::feature_gated;
 use polars_utils::total_ord::ToTotalOrd;
-use polars_utils::unwrap::UnwrapUncheckedRelease;
 
 use super::*;
+use crate::CHEAP_SERIES_HASH_LIMIT;
 #[cfg(feature = "dtype-struct")]
 use crate::prelude::any_value::arr_to_any_value;
 
@@ -26,6 +21,12 @@ impl Clone for OwnedObject {
         Self(self.0.to_boxed())
     }
 }
+
+#[cfg(feature = "dtype-decimal")]
+use polars_compute::decimal::{
+    dec128_cmp, dec128_eq, dec128_rescale, dec128_to_f64, dec128_to_i128, f64_to_dec128,
+    i128_to_dec128,
+};
 
 #[derive(Debug, Clone, Default)]
 pub enum AnyValue<'a> {
@@ -43,6 +44,8 @@ pub enum AnyValue<'a> {
     UInt32(u32),
     /// An unsigned 64-bit integer number.
     UInt64(u64),
+    /// An unsigned 128-bit integer number.
+    UInt128(u128),
     /// An 8-bit integer number.
     Int8(i8),
     /// A 16-bit integer number.
@@ -51,6 +54,8 @@ pub enum AnyValue<'a> {
     Int32(i32),
     /// A 64-bit integer number.
     Int64(i64),
+    /// A 128-bit integer number.
+    Int128(i128),
     /// A 32-bit floating point number.
     Float32(f32),
     /// A 64-bit floating point number.
@@ -73,18 +78,14 @@ pub enum AnyValue<'a> {
     /// A 64-bit time representing the elapsed time since midnight in nanoseconds
     #[cfg(feature = "dtype-time")]
     Time(i64),
-    // If syncptr is_null the data is in the rev-map
-    // otherwise it is in the array pointer
     #[cfg(feature = "dtype-categorical")]
-    Categorical(u32, &'a RevMapping, SyncPtr<Utf8ViewArray>),
-    // If syncptr is_null the data is in the rev-map
-    // otherwise it is in the array pointer
+    Categorical(CatSize, &'a Arc<CategoricalMapping>),
     #[cfg(feature = "dtype-categorical")]
-    CategoricalOwned(u32, Arc<RevMapping>, SyncPtr<Utf8ViewArray>),
+    CategoricalOwned(CatSize, Arc<CategoricalMapping>),
     #[cfg(feature = "dtype-categorical")]
-    Enum(u32, &'a RevMapping, SyncPtr<Utf8ViewArray>),
+    Enum(CatSize, &'a Arc<CategoricalMapping>),
     #[cfg(feature = "dtype-categorical")]
-    EnumOwned(u32, Arc<RevMapping>, SyncPtr<Utf8ViewArray>),
+    EnumOwned(CatSize, Arc<CategoricalMapping>),
     /// Nested type, contains arrays that are filled with one of the datatypes.
     List(Series),
     #[cfg(feature = "dtype-array")]
@@ -106,250 +107,9 @@ pub enum AnyValue<'a> {
     StringOwned(PlSmallStr),
     Binary(&'a [u8]),
     BinaryOwned(Vec<u8>),
-    /// A 128-bit fixed point decimal number with a scale.
+    /// A 128-bit fixed point decimal number with a precision and scale.
     #[cfg(feature = "dtype-decimal")]
-    Decimal(i128, usize),
-}
-
-#[cfg(feature = "serde")]
-impl Serialize for AnyValue<'_> {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let name = "AnyValue";
-        match self {
-            AnyValue::Null => serializer.serialize_unit_variant(name, 0, "Null"),
-            AnyValue::Int8(v) => serializer.serialize_newtype_variant(name, 1, "Int8", v),
-            AnyValue::Int16(v) => serializer.serialize_newtype_variant(name, 2, "Int16", v),
-            AnyValue::Int32(v) => serializer.serialize_newtype_variant(name, 3, "Int32", v),
-            AnyValue::Int64(v) => serializer.serialize_newtype_variant(name, 4, "Int64", v),
-            AnyValue::UInt8(v) => serializer.serialize_newtype_variant(name, 5, "UInt8", v),
-            AnyValue::UInt16(v) => serializer.serialize_newtype_variant(name, 6, "UInt16", v),
-            AnyValue::UInt32(v) => serializer.serialize_newtype_variant(name, 7, "UInt32", v),
-            AnyValue::UInt64(v) => serializer.serialize_newtype_variant(name, 8, "UInt64", v),
-            AnyValue::Float32(v) => serializer.serialize_newtype_variant(name, 9, "Float32", v),
-            AnyValue::Float64(v) => serializer.serialize_newtype_variant(name, 10, "Float64", v),
-            AnyValue::List(v) => serializer.serialize_newtype_variant(name, 11, "List", v),
-            AnyValue::Boolean(v) => serializer.serialize_newtype_variant(name, 12, "Bool", v),
-            // both string variants same number
-            AnyValue::String(v) => serializer.serialize_newtype_variant(name, 13, "StringOwned", v),
-            AnyValue::StringOwned(v) => {
-                serializer.serialize_newtype_variant(name, 13, "StringOwned", v.as_str())
-            },
-            AnyValue::Binary(v) => serializer.serialize_newtype_variant(name, 14, "BinaryOwned", v),
-            AnyValue::BinaryOwned(v) => {
-                serializer.serialize_newtype_variant(name, 14, "BinaryOwned", v)
-            },
-            _ => Err(serde::ser::Error::custom(
-                "Unknown data type. Cannot serialize",
-            )),
-        }
-    }
-}
-
-#[cfg(feature = "serde")]
-impl<'a> Deserialize<'a> for AnyValue<'static> {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'a>,
-    {
-        #[repr(u8)]
-        enum AvField {
-            Null,
-            Int8,
-            Int16,
-            Int32,
-            Int64,
-            UInt8,
-            UInt16,
-            UInt32,
-            UInt64,
-            Float32,
-            Float64,
-            List,
-            Bool,
-            StringOwned,
-            BinaryOwned,
-        }
-        const VARIANTS: &[&str] = &[
-            "Null",
-            "UInt8",
-            "UInt16",
-            "UInt32",
-            "UInt64",
-            "Int8",
-            "Int16",
-            "Int32",
-            "Int64",
-            "Float32",
-            "Float64",
-            "List",
-            "Boolean",
-            "StringOwned",
-            "BinaryOwned",
-        ];
-        const LAST: u8 = unsafe { std::mem::transmute::<_, u8>(AvField::BinaryOwned) };
-
-        struct FieldVisitor;
-
-        impl Visitor<'_> for FieldVisitor {
-            type Value = AvField;
-
-            fn expecting(&self, formatter: &mut Formatter) -> std::fmt::Result {
-                write!(formatter, "an integer between 0-{LAST}")
-            }
-
-            fn visit_i64<E>(self, v: i64) -> std::result::Result<Self::Value, E>
-            where
-                E: Error,
-            {
-                let field: u8 = NumCast::from(v).ok_or_else(|| {
-                    serde::de::Error::invalid_value(
-                        Unexpected::Signed(v),
-                        &"expected value that fits into u8",
-                    )
-                })?;
-
-                // SAFETY:
-                // we are repr: u8 and check last value that we are in bounds
-                let field = unsafe {
-                    if field <= LAST {
-                        std::mem::transmute::<u8, AvField>(field)
-                    } else {
-                        return Err(serde::de::Error::invalid_value(
-                            Unexpected::Signed(v),
-                            &"expected value that fits into AnyValue's number of fields",
-                        ));
-                    }
-                };
-                Ok(field)
-            }
-
-            fn visit_str<E>(self, v: &str) -> std::result::Result<Self::Value, E>
-            where
-                E: Error,
-            {
-                self.visit_bytes(v.as_bytes())
-            }
-
-            fn visit_bytes<E>(self, v: &[u8]) -> std::result::Result<Self::Value, E>
-            where
-                E: Error,
-            {
-                let field = match v {
-                    b"Null" => AvField::Null,
-                    b"Int8" => AvField::Int8,
-                    b"Int16" => AvField::Int16,
-                    b"Int32" => AvField::Int32,
-                    b"Int64" => AvField::Int64,
-                    b"UInt8" => AvField::UInt8,
-                    b"UInt16" => AvField::UInt16,
-                    b"UInt32" => AvField::UInt32,
-                    b"UInt64" => AvField::UInt64,
-                    b"Float32" => AvField::Float32,
-                    b"Float64" => AvField::Float64,
-                    b"List" => AvField::List,
-                    b"Bool" => AvField::Bool,
-                    b"StringOwned" | b"String" => AvField::StringOwned,
-                    b"BinaryOwned" | b"Binary" => AvField::BinaryOwned,
-                    _ => {
-                        return Err(serde::de::Error::unknown_variant(
-                            &String::from_utf8_lossy(v),
-                            VARIANTS,
-                        ))
-                    },
-                };
-                Ok(field)
-            }
-        }
-
-        impl<'a> Deserialize<'a> for AvField {
-            fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-            where
-                D: Deserializer<'a>,
-            {
-                deserializer.deserialize_identifier(FieldVisitor)
-            }
-        }
-
-        struct OuterVisitor;
-
-        impl<'b> Visitor<'b> for OuterVisitor {
-            type Value = AnyValue<'static>;
-
-            fn expecting(&self, formatter: &mut Formatter) -> std::fmt::Result {
-                write!(formatter, "enum AnyValue")
-            }
-
-            fn visit_enum<A>(self, data: A) -> std::result::Result<Self::Value, A::Error>
-            where
-                A: EnumAccess<'b>,
-            {
-                let out = match data.variant()? {
-                    (AvField::Null, _variant) => AnyValue::Null,
-                    (AvField::Int8, variant) => {
-                        let value = variant.newtype_variant()?;
-                        AnyValue::Int8(value)
-                    },
-                    (AvField::Int16, variant) => {
-                        let value = variant.newtype_variant()?;
-                        AnyValue::Int16(value)
-                    },
-                    (AvField::Int32, variant) => {
-                        let value = variant.newtype_variant()?;
-                        AnyValue::Int32(value)
-                    },
-                    (AvField::Int64, variant) => {
-                        let value = variant.newtype_variant()?;
-                        AnyValue::Int64(value)
-                    },
-                    (AvField::UInt8, variant) => {
-                        let value = variant.newtype_variant()?;
-                        AnyValue::UInt8(value)
-                    },
-                    (AvField::UInt16, variant) => {
-                        let value = variant.newtype_variant()?;
-                        AnyValue::UInt16(value)
-                    },
-                    (AvField::UInt32, variant) => {
-                        let value = variant.newtype_variant()?;
-                        AnyValue::UInt32(value)
-                    },
-                    (AvField::UInt64, variant) => {
-                        let value = variant.newtype_variant()?;
-                        AnyValue::UInt64(value)
-                    },
-                    (AvField::Float32, variant) => {
-                        let value = variant.newtype_variant()?;
-                        AnyValue::Float32(value)
-                    },
-                    (AvField::Float64, variant) => {
-                        let value = variant.newtype_variant()?;
-                        AnyValue::Float64(value)
-                    },
-                    (AvField::Bool, variant) => {
-                        let value = variant.newtype_variant()?;
-                        AnyValue::Boolean(value)
-                    },
-                    (AvField::List, variant) => {
-                        let value = variant.newtype_variant()?;
-                        AnyValue::List(value)
-                    },
-                    (AvField::StringOwned, variant) => {
-                        let value: PlSmallStr = variant.newtype_variant()?;
-                        AnyValue::StringOwned(value)
-                    },
-                    (AvField::BinaryOwned, variant) => {
-                        let value = variant.newtype_variant()?;
-                        AnyValue::BinaryOwned(value)
-                    },
-                };
-                Ok(out)
-            }
-        }
-        deserializer.deserialize_enum("AnyValue", VARIANTS, OuterVisitor)
-    }
+    Decimal(i128, usize, usize),
 }
 
 impl AnyValue<'static> {
@@ -359,7 +119,7 @@ impl AnyValue<'static> {
             DataType::Binary => AnyValue::BinaryOwned(Vec::new()),
             DataType::Boolean => (0 as IdxSize).into(),
             // SAFETY: numeric values are static, inform the compiler of this.
-            d if d.is_numeric() => unsafe {
+            d if d.is_primitive_numeric() => unsafe {
                 std::mem::transmute::<AnyValue<'_>, AnyValue<'static>>(
                     AnyValue::UInt8(0).cast(dtype),
                 )
@@ -367,10 +127,91 @@ impl AnyValue<'static> {
             #[cfg(feature = "dtype-duration")]
             DataType::Duration(unit) => AnyValue::Duration(0, *unit),
             #[cfg(feature = "dtype-decimal")]
-            DataType::Decimal(_p, s) => {
-                AnyValue::Decimal(0, s.expect("unknown scale during execution"))
-            },
+            DataType::Decimal(p, s) => AnyValue::Decimal(0, *p, *s),
             _ => AnyValue::Null,
+        }
+    }
+
+    /// Can the [`AnyValue`] exist as having `dtype` as its `DataType`.
+    pub fn can_have_dtype(&self, dtype: &DataType) -> bool {
+        matches!(self, AnyValue::Null) || dtype == &self.dtype()
+    }
+
+    /// Generate a default dummy value for a given datatype.
+    pub fn default_value(
+        dtype: &DataType,
+        numeric_to_one: bool,
+        num_list_values: usize,
+    ) -> AnyValue<'static> {
+        use {AnyValue as AV, DataType as DT};
+        match dtype {
+            DT::Boolean => AV::Boolean(false),
+            DT::UInt8 => AV::UInt8(numeric_to_one.into()),
+            DT::UInt16 => AV::UInt16(numeric_to_one.into()),
+            DT::UInt32 => AV::UInt32(numeric_to_one.into()),
+            DT::UInt64 => AV::UInt64(numeric_to_one.into()),
+            DT::UInt128 => AV::UInt128(numeric_to_one.into()),
+            DT::Int8 => AV::Int8(numeric_to_one.into()),
+            DT::Int16 => AV::Int16(numeric_to_one.into()),
+            DT::Int32 => AV::Int32(numeric_to_one.into()),
+            DT::Int64 => AV::Int64(numeric_to_one.into()),
+            DT::Int128 => AV::Int128(numeric_to_one.into()),
+            DT::Float32 => AV::Float32(numeric_to_one.into()),
+            DT::Float64 => AV::Float64(numeric_to_one.into()),
+            #[cfg(feature = "dtype-decimal")]
+            DT::Decimal(p, s) => AV::Decimal(0, *p, *s),
+            DT::String => AV::String(""),
+            DT::Binary => AV::Binary(&[]),
+            DT::BinaryOffset => AV::Binary(&[]),
+            DT::Date => feature_gated!("dtype-date", AV::Date(0)),
+            DT::Datetime(time_unit, time_zone) => feature_gated!(
+                "dtype-datetime",
+                AV::DatetimeOwned(0, *time_unit, time_zone.clone().map(Arc::new))
+            ),
+            DT::Duration(time_unit) => {
+                feature_gated!("dtype-duration", AV::Duration(0, *time_unit))
+            },
+            DT::Time => feature_gated!("dtype-time", AV::Time(0)),
+            #[cfg(feature = "dtype-array")]
+            DT::Array(inner_dtype, width) => {
+                let inner_value =
+                    AnyValue::default_value(inner_dtype, numeric_to_one, num_list_values);
+                AV::Array(
+                    Scalar::new(inner_dtype.as_ref().clone(), inner_value)
+                        .into_series(PlSmallStr::EMPTY)
+                        .new_from_index(0, *width),
+                    *width,
+                )
+            },
+            DT::List(inner_dtype) => AV::List(if num_list_values == 0 {
+                Series::new_empty(PlSmallStr::EMPTY, inner_dtype.as_ref())
+            } else {
+                let inner_value =
+                    AnyValue::default_value(inner_dtype, numeric_to_one, num_list_values);
+
+                Scalar::new(inner_dtype.as_ref().clone(), inner_value)
+                    .into_series(PlSmallStr::EMPTY)
+                    .new_from_index(0, num_list_values)
+            }),
+            #[cfg(feature = "object")]
+            DT::Object(_) => AV::Null,
+            DT::Null => AV::Null,
+            #[cfg(feature = "dtype-categorical")]
+            DT::Categorical(_, _) => AV::Null,
+            #[cfg(feature = "dtype-categorical")]
+            DT::Enum(categories, mapping) => match categories.categories().is_empty() {
+                true => AV::Null,
+                false => AV::EnumOwned(0, mapping.clone()),
+            },
+            #[cfg(feature = "dtype-struct")]
+            DT::Struct(fields) => AV::StructOwned(Box::new((
+                fields
+                    .iter()
+                    .map(|f| AnyValue::default_value(f.dtype(), numeric_to_one, num_list_values))
+                    .collect(),
+                fields.clone(),
+            ))),
+            DT::Unknown(_) => unreachable!(),
         }
     }
 }
@@ -389,10 +230,12 @@ impl<'a> AnyValue<'a> {
             Int16(_) => DataType::Int16,
             Int32(_) => DataType::Int32,
             Int64(_) => DataType::Int64,
+            Int128(_) => DataType::Int128,
             UInt8(_) => DataType::UInt8,
             UInt16(_) => DataType::UInt16,
             UInt32(_) => DataType::UInt32,
             UInt64(_) => DataType::UInt64,
+            UInt128(_) => DataType::UInt128,
             Float32(_) => DataType::Float32,
             Float64(_) => DataType::Float64,
             String(_) | StringOwned(_) => DataType::String,
@@ -410,11 +253,11 @@ impl<'a> AnyValue<'a> {
             #[cfg(feature = "dtype-duration")]
             Duration(_, tu) => DataType::Duration(*tu),
             #[cfg(feature = "dtype-categorical")]
-            Categorical(_, _, _) | CategoricalOwned(_, _, _) => {
-                DataType::Categorical(None, Default::default())
+            Categorical(_, _) | CategoricalOwned(_, _) => {
+                unimplemented!("can not get dtype of Categorical AnyValue")
             },
             #[cfg(feature = "dtype-categorical")]
-            Enum(_, _, _) | EnumOwned(_, _, _) => DataType::Enum(None, Default::default()),
+            Enum(_, _) | EnumOwned(_, _) => unimplemented!("can not get dtype of Enum AnyValue"),
             List(s) => DataType::List(Box::new(s.dtype().clone())),
             #[cfg(feature = "dtype-array")]
             Array(s, size) => DataType::Array(Box::new(s.dtype().clone()), *size),
@@ -423,28 +266,30 @@ impl<'a> AnyValue<'a> {
             #[cfg(feature = "dtype-struct")]
             StructOwned(payload) => DataType::Struct(payload.1.clone()),
             #[cfg(feature = "dtype-decimal")]
-            Decimal(_, scale) => DataType::Decimal(None, Some(*scale)),
+            Decimal(_, p, s) => DataType::Decimal(*p, *s),
             #[cfg(feature = "object")]
-            Object(o) => DataType::Object(o.type_name(), None),
+            Object(o) => DataType::Object(o.type_name()),
             #[cfg(feature = "object")]
-            ObjectOwned(o) => DataType::Object(o.0.type_name(), None),
+            ObjectOwned(o) => DataType::Object(o.0.type_name()),
         }
     }
 
     /// Extract a numerical value from the AnyValue
     #[doc(hidden)]
     #[inline]
-    pub fn extract<T: NumCast>(&self) -> Option<T> {
+    pub fn extract<T: NumCast + IsFloat>(&self) -> Option<T> {
         use AnyValue::*;
         match self {
             Int8(v) => NumCast::from(*v),
             Int16(v) => NumCast::from(*v),
             Int32(v) => NumCast::from(*v),
             Int64(v) => NumCast::from(*v),
+            Int128(v) => NumCast::from(*v),
             UInt8(v) => NumCast::from(*v),
             UInt16(v) => NumCast::from(*v),
             UInt32(v) => NumCast::from(*v),
             UInt64(v) => NumCast::from(*v),
+            UInt128(v) => NumCast::from(*v),
             Float32(v) => NumCast::from(*v),
             Float64(v) => NumCast::from(*v),
             #[cfg(feature = "dtype-date")]
@@ -456,12 +301,11 @@ impl<'a> AnyValue<'a> {
             #[cfg(feature = "dtype-duration")]
             Duration(v, _) => NumCast::from(*v),
             #[cfg(feature = "dtype-decimal")]
-            Decimal(v, scale) => {
-                if *scale == 0 {
-                    NumCast::from(*v)
+            Decimal(v, _p, s) => {
+                if T::is_float() {
+                    NumCast::from(dec128_to_f64(*v, *s))
                 } else {
-                    let f: Option<f64> = NumCast::from(*v);
-                    NumCast::from(f? / 10f64.powi(*scale as _))
+                    NumCast::from(dec128_to_i128(*v, *s))
                 }
             },
             Boolean(v) => NumCast::from(if *v { 1 } else { 0 }),
@@ -478,7 +322,7 @@ impl<'a> AnyValue<'a> {
     }
 
     #[inline]
-    pub fn try_extract<T: NumCast>(&self) -> PolarsResult<T> {
+    pub fn try_extract<T: NumCast + IsFloat>(&self) -> PolarsResult<T> {
         self.extract().ok_or_else(|| {
             polars_err!(
                 ComputeError: "could not extract number from any-value of dtype: '{:?}'",
@@ -491,7 +335,7 @@ impl<'a> AnyValue<'a> {
         matches!(self, AnyValue::Boolean(_))
     }
 
-    pub fn is_numeric(&self) -> bool {
+    pub fn is_primitive_numeric(&self) -> bool {
         self.is_integer() || self.is_float()
     }
 
@@ -506,14 +350,22 @@ impl<'a> AnyValue<'a> {
     pub fn is_signed_integer(&self) -> bool {
         matches!(
             self,
-            AnyValue::Int8(_) | AnyValue::Int16(_) | AnyValue::Int32(_) | AnyValue::Int64(_)
+            AnyValue::Int8(_)
+                | AnyValue::Int16(_)
+                | AnyValue::Int32(_)
+                | AnyValue::Int64(_)
+                | AnyValue::Int128(_)
         )
     }
 
     pub fn is_unsigned_integer(&self) -> bool {
         matches!(
             self,
-            AnyValue::UInt8(_) | AnyValue::UInt16(_) | AnyValue::UInt32(_) | AnyValue::UInt64(_)
+            AnyValue::UInt8(_)
+                | AnyValue::UInt16(_)
+                | AnyValue::UInt32(_)
+                | AnyValue::UInt64(_)
+                | AnyValue::UInt128(_)
         )
     }
 
@@ -533,6 +385,8 @@ impl<'a> AnyValue<'a> {
         match self {
             AnyValue::Null => true,
             AnyValue::List(s) => s.null_count() == s.len(),
+            #[cfg(feature = "dtype-array")]
+            AnyValue::Array(s, _) => s.null_count() == s.len(),
             #[cfg(feature = "dtype-struct")]
             AnyValue::Struct(_, _, _) => self._iter_struct_av().all(|av| av.is_nested_null()),
             _ => false,
@@ -548,10 +402,12 @@ impl<'a> AnyValue<'a> {
             (av, DataType::UInt16) => AnyValue::UInt16(av.extract::<u16>()?),
             (av, DataType::UInt32) => AnyValue::UInt32(av.extract::<u32>()?),
             (av, DataType::UInt64) => AnyValue::UInt64(av.extract::<u64>()?),
+            (av, DataType::UInt128) => AnyValue::UInt128(av.extract::<u128>()?),
             (av, DataType::Int8) => AnyValue::Int8(av.extract::<i8>()?),
             (av, DataType::Int16) => AnyValue::Int16(av.extract::<i16>()?),
             (av, DataType::Int32) => AnyValue::Int32(av.extract::<i32>()?),
             (av, DataType::Int64) => AnyValue::Int64(av.extract::<i64>()?),
+            (av, DataType::Int128) => AnyValue::Int128(av.extract::<i128>()?),
             (av, DataType::Float32) => AnyValue::Float32(av.extract::<f32>()?),
             (av, DataType::Float64) => AnyValue::Float64(av.extract::<f64>()?),
 
@@ -560,22 +416,93 @@ impl<'a> AnyValue<'a> {
             (AnyValue::UInt16(v), DataType::Boolean) => AnyValue::Boolean(*v != u16::default()),
             (AnyValue::UInt32(v), DataType::Boolean) => AnyValue::Boolean(*v != u32::default()),
             (AnyValue::UInt64(v), DataType::Boolean) => AnyValue::Boolean(*v != u64::default()),
+            (AnyValue::UInt128(v), DataType::Boolean) => AnyValue::Boolean(*v != u128::default()),
             (AnyValue::Int8(v), DataType::Boolean) => AnyValue::Boolean(*v != i8::default()),
             (AnyValue::Int16(v), DataType::Boolean) => AnyValue::Boolean(*v != i16::default()),
             (AnyValue::Int32(v), DataType::Boolean) => AnyValue::Boolean(*v != i32::default()),
             (AnyValue::Int64(v), DataType::Boolean) => AnyValue::Boolean(*v != i64::default()),
+            (AnyValue::Int128(v), DataType::Boolean) => AnyValue::Boolean(*v != i128::default()),
             (AnyValue::Float32(v), DataType::Boolean) => AnyValue::Boolean(*v != f32::default()),
             (AnyValue::Float64(v), DataType::Boolean) => AnyValue::Boolean(*v != f64::default()),
 
-            // to string
-            (av, DataType::String) => {
-                if av.is_unsigned_integer() {
-                    AnyValue::StringOwned(format_pl_smallstr!("{}", av.extract::<u64>()?))
-                } else if av.is_float() {
-                    AnyValue::StringOwned(format_pl_smallstr!("{}", av.extract::<f64>()?))
+            // Categorical casts.
+            #[cfg(feature = "dtype-categorical")]
+            (
+                &AnyValue::Categorical(cat, &ref lmap) | &AnyValue::CategoricalOwned(cat, ref lmap),
+                DataType::Categorical(_, rmap),
+            ) => {
+                if Arc::ptr_eq(lmap, rmap) {
+                    self.clone()
                 } else {
-                    AnyValue::StringOwned(format_pl_smallstr!("{}", av.extract::<i64>()?))
+                    let s = unsafe { lmap.cat_to_str_unchecked(cat) };
+                    let new_cat = rmap.insert_cat(s).unwrap();
+                    AnyValue::CategoricalOwned(new_cat, rmap.clone())
                 }
+            },
+
+            #[cfg(feature = "dtype-categorical")]
+            (
+                &AnyValue::Enum(cat, &ref lmap) | &AnyValue::EnumOwned(cat, ref lmap),
+                DataType::Enum(_, rmap),
+            ) => {
+                if Arc::ptr_eq(lmap, rmap) {
+                    self.clone()
+                } else {
+                    let s = unsafe { lmap.cat_to_str_unchecked(cat) };
+                    let new_cat = rmap.get_cat(s)?;
+                    AnyValue::EnumOwned(new_cat, rmap.clone())
+                }
+            },
+
+            #[cfg(feature = "dtype-categorical")]
+            (
+                &AnyValue::Categorical(cat, &ref map)
+                | &AnyValue::CategoricalOwned(cat, ref map)
+                | &AnyValue::Enum(cat, &ref map)
+                | &AnyValue::EnumOwned(cat, ref map),
+                DataType::String,
+            ) => {
+                let s = unsafe { map.cat_to_str_unchecked(cat) };
+                AnyValue::StringOwned(PlSmallStr::from(s))
+            },
+
+            #[cfg(feature = "dtype-categorical")]
+            (AnyValue::String(s), DataType::Categorical(_, map)) => {
+                AnyValue::CategoricalOwned(map.insert_cat(s).unwrap(), map.clone())
+            },
+
+            #[cfg(feature = "dtype-categorical")]
+            (AnyValue::StringOwned(s), DataType::Categorical(_, map)) => {
+                AnyValue::CategoricalOwned(map.insert_cat(s).unwrap(), map.clone())
+            },
+
+            #[cfg(feature = "dtype-categorical")]
+            (AnyValue::String(s), DataType::Enum(_, map)) => {
+                AnyValue::CategoricalOwned(map.get_cat(s)?, map.clone())
+            },
+
+            #[cfg(feature = "dtype-categorical")]
+            (AnyValue::StringOwned(s), DataType::Enum(_, map)) => {
+                AnyValue::CategoricalOwned(map.get_cat(s)?, map.clone())
+            },
+
+            // to string
+            (AnyValue::String(v), DataType::String) => AnyValue::String(v),
+            (AnyValue::StringOwned(v), DataType::String) => AnyValue::StringOwned(v.clone()),
+
+            (av, DataType::String) => {
+                let mut tmp = vec![];
+                if av.is_unsigned_integer() {
+                    let val = av.extract::<u64>()?;
+                    SerPrimitive::write(&mut tmp, val);
+                } else if av.is_float() {
+                    let val = av.extract::<f64>()?;
+                    SerPrimitive::write(&mut tmp, val);
+                } else {
+                    let val = av.extract::<i64>()?;
+                    SerPrimitive::write(&mut tmp, val);
+                }
+                AnyValue::StringOwned(PlSmallStr::from_str(std::str::from_utf8(&tmp).unwrap()))
             },
 
             // to binary
@@ -583,7 +510,7 @@ impl<'a> AnyValue<'a> {
 
             // to datetime
             #[cfg(feature = "dtype-datetime")]
-            (av, DataType::Datetime(tu, tz)) if av.is_numeric() => {
+            (av, DataType::Datetime(tu, tz)) if av.is_primitive_numeric() => {
                 AnyValue::Datetime(av.extract::<i64>()?, *tu, tz.as_ref())
             },
             #[cfg(all(feature = "dtype-datetime", feature = "dtype-date"))]
@@ -616,7 +543,9 @@ impl<'a> AnyValue<'a> {
 
             // to date
             #[cfg(feature = "dtype-date")]
-            (av, DataType::Date) if av.is_numeric() => AnyValue::Date(av.extract::<i32>()?),
+            (av, DataType::Date) if av.is_primitive_numeric() => {
+                AnyValue::Date(av.extract::<i32>()?)
+            },
             #[cfg(all(feature = "dtype-date", feature = "dtype-datetime"))]
             (AnyValue::Datetime(v, tu, _) | AnyValue::DatetimeOwned(v, tu, _), DataType::Date) => {
                 AnyValue::Date(match tu {
@@ -628,7 +557,9 @@ impl<'a> AnyValue<'a> {
 
             // to time
             #[cfg(feature = "dtype-time")]
-            (av, DataType::Time) if av.is_numeric() => AnyValue::Time(av.extract::<i64>()?),
+            (av, DataType::Time) if av.is_primitive_numeric() => {
+                AnyValue::Time(av.extract::<i64>()?)
+            },
             #[cfg(all(feature = "dtype-time", feature = "dtype-datetime"))]
             (AnyValue::Datetime(v, tu, _) | AnyValue::DatetimeOwned(v, tu, _), DataType::Time) => {
                 AnyValue::Time(match tu {
@@ -640,7 +571,7 @@ impl<'a> AnyValue<'a> {
 
             // to duration
             #[cfg(feature = "dtype-duration")]
-            (av, DataType::Duration(tu)) if av.is_numeric() => {
+            (av, DataType::Duration(tu)) if av.is_primitive_numeric() => {
                 AnyValue::Duration(av.extract::<i64>()?, *tu)
             },
             #[cfg(all(feature = "dtype-duration", feature = "dtype-time"))]
@@ -667,33 +598,24 @@ impl<'a> AnyValue<'a> {
                 *tu_r,
             ),
 
-            // to decimal
             #[cfg(feature = "dtype-decimal")]
-            (av, DataType::Decimal(prec, scale)) if av.is_integer() => {
-                let value = av.try_extract::<i128>().unwrap();
-                let scale = scale.unwrap_or(0);
-                let factor = 10_i128.pow(scale as _); // Conversion to u32 is safe, max value is 38.
-                let converted = value.checked_mul(factor)?;
-
-                // Check if the converted value fits into the specified precision
-                let prec = prec.unwrap_or(38) as u32;
-                let num_digits = (converted.abs() as f64).log10().ceil() as u32;
-                if num_digits > prec {
-                    return None;
-                }
-
-                AnyValue::Decimal(converted, scale)
+            (av, DataType::Decimal(p, s)) if av.is_integer() => {
+                let int = av.try_extract::<i128>().ok()?;
+                let dec = i128_to_dec128(int, *p, *s)?;
+                AnyValue::Decimal(dec, *p, *s)
             },
+
             #[cfg(feature = "dtype-decimal")]
-            (AnyValue::Decimal(value, scale_av), DataType::Decimal(_, scale)) => {
-                let Some(scale) = scale else {
-                    return Some(self.clone());
-                };
-                // TODO: Allow lossy conversion?
-                let scale_diff = scale.checked_sub(*scale_av)?;
-                let factor = 10_i128.pow(scale_diff as _); // Conversion is safe, max value is 38.
-                let converted = value.checked_mul(factor)?;
-                AnyValue::Decimal(converted, *scale)
+            (av, DataType::Decimal(p, s)) if av.is_float() => {
+                let f = av.try_extract::<f64>().unwrap();
+                let dec = f64_to_dec128(f, *p, *s)?;
+                AnyValue::Decimal(dec, *p, *s)
+            },
+
+            #[cfg(feature = "dtype-decimal")]
+            (AnyValue::Decimal(value, _old_p, old_s), DataType::Decimal(p, s)) => {
+                let converted = dec128_rescale(*value, *old_s, *p, *s)?;
+                AnyValue::Decimal(converted, *p, *s)
             },
 
             // to self
@@ -735,22 +657,106 @@ impl<'a> AnyValue<'a> {
             Self::StringOwned(s) => Cow::Owned(s.to_string()),
             Self::Null => Cow::Borrowed("null"),
             #[cfg(feature = "dtype-categorical")]
-            Self::Categorical(idx, rev, arr) | AnyValue::Enum(idx, rev, arr) => {
-                if arr.is_null() {
-                    Cow::Borrowed(rev.get(*idx))
-                } else {
-                    unsafe { Cow::Borrowed(arr.deref_unchecked().value(*idx as usize)) }
-                }
+            Self::Categorical(cat, map) | Self::Enum(cat, map) => {
+                Cow::Borrowed(unsafe { map.cat_to_str_unchecked(*cat) })
             },
             #[cfg(feature = "dtype-categorical")]
-            Self::CategoricalOwned(idx, rev, arr) | AnyValue::EnumOwned(idx, rev, arr) => {
-                if arr.is_null() {
-                    Cow::Owned(rev.get(*idx).to_string())
-                } else {
-                    unsafe { Cow::Borrowed(arr.deref_unchecked().value(*idx as usize)) }
-                }
+            Self::CategoricalOwned(cat, map) | Self::EnumOwned(cat, map) => {
+                Cow::Owned(unsafe { map.cat_to_str_unchecked(*cat) }.to_owned())
             },
             av => Cow::Owned(av.to_string()),
+        }
+    }
+
+    pub fn to_physical(self) -> Self {
+        match self {
+            Self::Null
+            | Self::Boolean(_)
+            | Self::String(_)
+            | Self::StringOwned(_)
+            | Self::Binary(_)
+            | Self::BinaryOwned(_)
+            | Self::UInt8(_)
+            | Self::UInt16(_)
+            | Self::UInt32(_)
+            | Self::UInt64(_)
+            | Self::UInt128(_)
+            | Self::Int8(_)
+            | Self::Int16(_)
+            | Self::Int32(_)
+            | Self::Int64(_)
+            | Self::Int128(_)
+            | Self::Float32(_)
+            | Self::Float64(_) => self,
+
+            #[cfg(feature = "object")]
+            Self::Object(_) | Self::ObjectOwned(_) => self,
+
+            #[cfg(feature = "dtype-date")]
+            Self::Date(v) => Self::Int32(v),
+            #[cfg(feature = "dtype-datetime")]
+            Self::Datetime(v, _, _) | Self::DatetimeOwned(v, _, _) => Self::Int64(v),
+
+            #[cfg(feature = "dtype-duration")]
+            Self::Duration(v, _) => Self::Int64(v),
+            #[cfg(feature = "dtype-time")]
+            Self::Time(v) => Self::Int64(v),
+
+            #[cfg(feature = "dtype-categorical")]
+            Self::Categorical(v, _)
+            | Self::CategoricalOwned(v, _)
+            | Self::Enum(v, _)
+            | Self::EnumOwned(v, _) => Self::UInt32(v),
+            Self::List(series) => Self::List(series.to_physical_repr().into_owned()),
+
+            #[cfg(feature = "dtype-array")]
+            Self::Array(series, width) => {
+                Self::Array(series.to_physical_repr().into_owned(), width)
+            },
+
+            #[cfg(feature = "dtype-struct")]
+            Self::Struct(_, _, _) => todo!(),
+            #[cfg(feature = "dtype-struct")]
+            Self::StructOwned(values) => Self::StructOwned(Box::new((
+                values.0.into_iter().map(|v| v.to_physical()).collect(),
+                values
+                    .1
+                    .into_iter()
+                    .map(|mut f| {
+                        f.dtype = f.dtype.to_physical();
+                        f
+                    })
+                    .collect(),
+            ))),
+
+            #[cfg(feature = "dtype-decimal")]
+            Self::Decimal(v, _, _) => Self::Int128(v),
+        }
+    }
+
+    #[inline]
+    pub fn extract_bool(&self) -> Option<bool> {
+        match self {
+            AnyValue::Boolean(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn extract_str(&self) -> Option<&str> {
+        match self {
+            AnyValue::String(v) => Some(v),
+            AnyValue::StringOwned(v) => Some(v.as_str()),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn extract_bytes(&self) -> Option<&[u8]> {
+        match self {
+            AnyValue::Binary(v) => Some(v),
+            AnyValue::BinaryOwned(v) => Some(v.as_slice()),
+            _ => None,
         }
     }
 }
@@ -776,10 +782,12 @@ impl AnyValue<'_> {
             Int16(v) => v.hash(state),
             Int32(v) => v.hash(state),
             Int64(v) => v.hash(state),
+            Int128(v) => feature_gated!("dtype-i128", v.hash(state)),
             UInt8(v) => v.hash(state),
             UInt16(v) => v.hash(state),
             UInt32(v) => v.hash(state),
             UInt64(v) => v.hash(state),
+            UInt128(v) => feature_gated!("dtype-u128", v.hash(state)),
             String(v) => v.hash(state),
             StringOwned(v) => v.hash(state),
             Float32(v) => v.to_ne_bytes().hash(state),
@@ -788,13 +796,13 @@ impl AnyValue<'_> {
             BinaryOwned(v) => v.hash(state),
             Boolean(v) => v.hash(state),
             List(v) => {
-                if !cheap {
+                if !cheap || v.len() < CHEAP_SERIES_HASH_LIMIT {
                     Hash::hash(&Wrap(v.clone()), state)
                 }
             },
             #[cfg(feature = "dtype-array")]
             Array(v, width) => {
-                if !cheap {
+                if !cheap || v.len() < CHEAP_SERIES_HASH_LIMIT {
                     Hash::hash(&Wrap(v.clone()), state)
                 }
                 width.hash(state)
@@ -821,10 +829,9 @@ impl AnyValue<'_> {
             #[cfg(feature = "dtype-time")]
             Time(v) => v.hash(state),
             #[cfg(feature = "dtype-categorical")]
-            Categorical(v, _, _)
-            | CategoricalOwned(v, _, _)
-            | Enum(v, _, _)
-            | EnumOwned(v, _, _) => v.hash(state),
+            Categorical(v, _) | CategoricalOwned(v, _) | Enum(v, _) | EnumOwned(v, _) => {
+                v.hash(state)
+            },
             #[cfg(feature = "object")]
             Object(_) => {},
             #[cfg(feature = "object")]
@@ -840,22 +847,23 @@ impl AnyValue<'_> {
             #[cfg(feature = "dtype-struct")]
             StructOwned(v) => v.0.hash(state),
             #[cfg(feature = "dtype-decimal")]
-            Decimal(v, k) => {
+            Decimal(v, s, p) => {
                 v.hash(state);
-                k.hash(state);
+                s.hash(state);
+                p.hash(state);
             },
             Null => {},
         }
     }
 }
 
-impl<'a> Hash for AnyValue<'a> {
+impl Hash for AnyValue<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.hash_impl(state, false)
     }
 }
 
-impl<'a> Eq for AnyValue<'a> {}
+impl Eq for AnyValue<'_> {}
 
 impl<'a, T> From<Option<T>> for AnyValue<'a>
 where
@@ -907,12 +915,35 @@ impl<'a> AnyValue<'a> {
         }
     }
 
+    pub(crate) fn to_i128(&self) -> Option<i128> {
+        match self {
+            AnyValue::UInt8(v) => Some((*v).into()),
+            AnyValue::UInt16(v) => Some((*v).into()),
+            AnyValue::UInt32(v) => Some((*v).into()),
+            AnyValue::UInt64(v) => Some((*v).into()),
+            AnyValue::Int8(v) => Some((*v).into()),
+            AnyValue::Int16(v) => Some((*v).into()),
+            AnyValue::Int32(v) => Some((*v).into()),
+            AnyValue::Int64(v) => Some((*v).into()),
+            AnyValue::Int128(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn to_f64(&self) -> Option<f64> {
+        match self {
+            AnyValue::Float32(v) => Some((*v).into()),
+            AnyValue::Float64(v) => Some(*v),
+            _ => None,
+        }
+    }
+
     #[must_use]
     pub fn add(&self, rhs: &AnyValue) -> AnyValue<'static> {
         use AnyValue::*;
         match (self, rhs) {
-            (Null, r) => r.clone().into_static().unwrap(),
-            (l, Null) => l.clone().into_static().unwrap(),
+            (Null, r) => r.clone().into_static(),
+            (l, Null) => l.clone().into_static(),
             (Int32(l), Int32(r)) => Int32(l + r),
             (Int64(l), Int64(r)) => Int64(l + r),
             (UInt32(l), UInt32(r)) => UInt32(l + r),
@@ -928,12 +959,14 @@ impl<'a> AnyValue<'a> {
                 Duration(l + r, *lu)
             },
             #[cfg(feature = "dtype-decimal")]
-            (Decimal(l, ls), Decimal(r, rs)) => {
-                if ls != rs {
-                    unimplemented!("adding decimals with different scales is not supported here");
+            (Decimal(l, lp, ls), Decimal(r, rp, rs)) => {
+                if (lp, ls) != (rp, rs) {
+                    unimplemented!(
+                        "adding decimals with different precisions/scales is not supported here"
+                    );
                 }
 
-                Decimal(l + r, *ls)
+                Decimal(l + r, *lp, *ls)
             },
             _ => unimplemented!(),
         }
@@ -949,11 +982,9 @@ impl<'a> AnyValue<'a> {
                 AnyValue::Datetime(*v, *tu, tz.as_ref().map(AsRef::as_ref))
             },
             #[cfg(feature = "dtype-categorical")]
-            AnyValue::CategoricalOwned(v, rev, arr) => {
-                AnyValue::Categorical(*v, rev.as_ref(), *arr)
-            },
+            AnyValue::CategoricalOwned(cat, map) => AnyValue::Categorical(*cat, map),
             #[cfg(feature = "dtype-categorical")]
-            AnyValue::EnumOwned(v, rev, arr) => AnyValue::Enum(*v, rev.as_ref(), *arr),
+            AnyValue::EnumOwned(cat, map) => AnyValue::Enum(*cat, map),
             av => av.clone(),
         }
     }
@@ -961,18 +992,20 @@ impl<'a> AnyValue<'a> {
     /// Try to coerce to an AnyValue with static lifetime.
     /// This can be done if it does not borrow any values.
     #[inline]
-    pub fn into_static(self) -> PolarsResult<AnyValue<'static>> {
+    pub fn into_static(self) -> AnyValue<'static> {
         use AnyValue::*;
-        let av = match self {
+        match self {
             Null => Null,
             Int8(v) => Int8(v),
             Int16(v) => Int16(v),
             Int32(v) => Int32(v),
             Int64(v) => Int64(v),
+            Int128(v) => Int128(v),
             UInt8(v) => UInt8(v),
             UInt16(v) => UInt16(v),
             UInt32(v) => UInt32(v),
             UInt64(v) => UInt64(v),
+            UInt128(v) => UInt128(v),
             Boolean(v) => Boolean(v),
             Float32(v) => Float32(v),
             Float64(v) => Float64(v),
@@ -997,7 +1030,7 @@ impl<'a> AnyValue<'a> {
             Object(v) => ObjectOwned(OwnedObject(v.to_boxed())),
             #[cfg(feature = "dtype-struct")]
             Struct(idx, arr, fields) => {
-                let avs = struct_to_avs_static(idx, arr, fields)?;
+                let avs = struct_to_avs_static(idx, arr, fields);
                 StructOwned(Box::new((avs, fields.to_vec())))
             },
             #[cfg(feature = "dtype-struct")]
@@ -1013,17 +1046,16 @@ impl<'a> AnyValue<'a> {
                 unsafe { std::mem::transmute::<AnyValue<'a>, AnyValue<'static>>(av) }
             },
             #[cfg(feature = "dtype-decimal")]
-            Decimal(val, scale) => Decimal(val, scale),
+            Decimal(val, s, p) => Decimal(val, s, p),
             #[cfg(feature = "dtype-categorical")]
-            Categorical(v, rev, arr) => CategoricalOwned(v, Arc::new(rev.clone()), arr),
+            Categorical(cat, map) => CategoricalOwned(cat, map.clone()),
             #[cfg(feature = "dtype-categorical")]
-            CategoricalOwned(v, rev, arr) => CategoricalOwned(v, rev, arr),
+            CategoricalOwned(cat, map) => CategoricalOwned(cat, map),
             #[cfg(feature = "dtype-categorical")]
-            Enum(v, rev, arr) => EnumOwned(v, Arc::new(rev.clone()), arr),
+            Enum(cat, map) => EnumOwned(cat, map.clone()),
             #[cfg(feature = "dtype-categorical")]
-            EnumOwned(v, rev, arr) => EnumOwned(v, rev, arr),
-        };
-        Ok(av)
+            EnumOwned(cat, map) => EnumOwned(cat, map),
+        }
     }
 
     /// Get a reference to the `&str` contained within [`AnyValue`].
@@ -1032,22 +1064,12 @@ impl<'a> AnyValue<'a> {
             AnyValue::String(s) => Some(s),
             AnyValue::StringOwned(s) => Some(s.as_str()),
             #[cfg(feature = "dtype-categorical")]
-            AnyValue::Categorical(idx, rev, arr) | AnyValue::Enum(idx, rev, arr) => {
-                let s = if arr.is_null() {
-                    rev.get(*idx)
-                } else {
-                    unsafe { arr.deref_unchecked().value(*idx as usize) }
-                };
-                Some(s)
+            Self::Categorical(cat, map) | Self::Enum(cat, map) => {
+                Some(unsafe { map.cat_to_str_unchecked(*cat) })
             },
             #[cfg(feature = "dtype-categorical")]
-            AnyValue::CategoricalOwned(idx, rev, arr) | AnyValue::EnumOwned(idx, rev, arr) => {
-                let s = if arr.is_null() {
-                    rev.get(*idx)
-                } else {
-                    unsafe { arr.deref_unchecked().value(*idx as usize) }
-                };
-                Some(s)
+            Self::CategoricalOwned(cat, map) | Self::EnumOwned(cat, map) => {
+                Some(unsafe { map.cat_to_str_unchecked(*cat) })
             },
             _ => None,
         }
@@ -1070,6 +1092,37 @@ impl<'a> From<AnyValue<'a>> for Option<i64> {
 impl AnyValue<'_> {
     #[inline]
     pub fn eq_missing(&self, other: &Self, null_equal: bool) -> bool {
+        fn struct_owned_value_iter<'a>(
+            v: &'a (Vec<AnyValue<'_>>, Vec<Field>),
+        ) -> impl ExactSizeIterator<Item = AnyValue<'a>> {
+            v.0.iter().map(|v| v.as_borrowed())
+        }
+        fn struct_value_iter(
+            idx: usize,
+            arr: &StructArray,
+        ) -> impl ExactSizeIterator<Item = AnyValue<'_>> {
+            assert!(idx < arr.len());
+
+            arr.values().iter().map(move |field_arr| unsafe {
+                // SAFETY: We asserted before that idx is smaller than the array length. Since it
+                // is an invariant of StructArray that all fields have the same length this is fine
+                // to do.
+                field_arr.get_unchecked(idx)
+            })
+        }
+
+        fn struct_eq_missing<'a>(
+            l: impl ExactSizeIterator<Item = AnyValue<'a>>,
+            r: impl ExactSizeIterator<Item = AnyValue<'a>>,
+            null_equal: bool,
+        ) -> bool {
+            if l.len() != r.len() {
+                return false;
+            }
+
+            l.zip(r).all(|(lv, rv)| lv.eq_missing(&rv, null_equal))
+        }
+
         use AnyValue::*;
         match (self, other) {
             // Map to borrowed.
@@ -1090,13 +1143,13 @@ impl AnyValue<'_> {
                 *l == Datetime(*rv, *rtu, rtz.as_ref().map(|v| v.as_ref()))
             },
             #[cfg(feature = "dtype-categorical")]
-            (CategoricalOwned(lv, lrev, larr), r) => Categorical(*lv, lrev.as_ref(), *larr) == *r,
+            (CategoricalOwned(cat, map), r) => Categorical(*cat, map) == *r,
             #[cfg(feature = "dtype-categorical")]
-            (l, CategoricalOwned(rv, rrev, rarr)) => *l == Categorical(*rv, rrev.as_ref(), *rarr),
+            (l, CategoricalOwned(cat, map)) => *l == Categorical(*cat, map),
             #[cfg(feature = "dtype-categorical")]
-            (EnumOwned(lv, lrev, larr), r) => Enum(*lv, lrev.as_ref(), *larr) == *r,
+            (EnumOwned(cat, map), r) => Enum(*cat, map) == *r,
             #[cfg(feature = "dtype-categorical")]
-            (l, EnumOwned(rv, rrev, rarr)) => *l == Enum(*rv, rrev.as_ref(), *rarr),
+            (l, EnumOwned(cat, map)) => *l == Enum(*cat, map),
 
             // Comparison with null.
             (Null, Null) => null_equal,
@@ -1109,10 +1162,12 @@ impl AnyValue<'_> {
             (UInt16(l), UInt16(r)) => *l == *r,
             (UInt32(l), UInt32(r)) => *l == *r,
             (UInt64(l), UInt64(r)) => *l == *r,
+            (UInt128(l), UInt128(r)) => *l == *r,
             (Int8(l), Int8(r)) => *l == *r,
             (Int16(l), Int16(r)) => *l == *r,
             (Int32(l), Int32(r)) => *l == *r,
             (Int64(l), Int64(r)) => *l == *r,
+            (Int128(l), Int128(r)) => *l == *r,
             (Float32(l), Float32(r)) => l.to_total_ord() == r.to_total_ord(),
             (Float64(l), Float64(r)) => l.to_total_ord() == r.to_total_ord(),
             (String(l), String(r)) => l == r,
@@ -1127,80 +1182,88 @@ impl AnyValue<'_> {
             },
             (List(l), List(r)) => l == r,
             #[cfg(feature = "dtype-categorical")]
-            (Categorical(idx_l, rev_l, ptr_l), Categorical(idx_r, rev_r, ptr_r)) => {
-                if !same_revmap(rev_l, *ptr_l, rev_r, *ptr_r) {
+            (Categorical(cat_l, map_l), Categorical(cat_r, map_r)) => {
+                if !Arc::ptr_eq(map_l, map_r) {
                     // We can't support this because our Hash impl directly hashes the index. If you
                     // add support for this we must change the Hash impl.
                     unimplemented!(
-                        "comparing categoricals with different revmaps is not supported"
+                        "comparing categoricals with different Categories is not supported through AnyValue"
                     );
                 }
 
-                idx_l == idx_r
+                cat_l == cat_r
             },
             #[cfg(feature = "dtype-categorical")]
-            (Enum(idx_l, rev_l, ptr_l), Enum(idx_r, rev_r, ptr_r)) => {
-                // We can't support this because our Hash impl directly hashes the index. If you
-                // add support for this we must change the Hash impl.
-                if !same_revmap(rev_l, *ptr_l, rev_r, *ptr_r) {
-                    unimplemented!("comparing enums with different revmaps is not supported");
+            (Enum(cat_l, map_l), Enum(cat_r, map_r)) => {
+                if !Arc::ptr_eq(map_l, map_r) {
+                    // We can't support this because our Hash impl directly hashes the index. If you
+                    // add support for this we must change the Hash impl.
+                    unimplemented!(
+                        "comparing enums with different FrozenCategories is not supported through AnyValue"
+                    );
                 }
 
-                idx_l == idx_r
+                cat_l == cat_r
             },
             #[cfg(feature = "dtype-duration")]
             (Duration(l, tu_l), Duration(r, tu_r)) => l == r && tu_l == tu_r,
+
             #[cfg(feature = "dtype-struct")]
-            (StructOwned(l), StructOwned(r)) => {
-                let l_av = &*l.0;
-                let r_av = &*r.0;
-                l_av == r_av
-            },
+            (StructOwned(l), StructOwned(r)) => struct_eq_missing(
+                struct_owned_value_iter(l.as_ref()),
+                struct_owned_value_iter(r.as_ref()),
+                null_equal,
+            ),
             #[cfg(feature = "dtype-struct")]
-            (StructOwned(l), Struct(idx, arr, fields)) => {
-                l.0.iter()
-                    .eq_by_(struct_av_iter(*idx, arr, fields), |lv, rv| *lv == rv)
-            },
+            (StructOwned(l), Struct(idx, arr, _)) => struct_eq_missing(
+                struct_owned_value_iter(l.as_ref()),
+                struct_value_iter(*idx, arr),
+                null_equal,
+            ),
             #[cfg(feature = "dtype-struct")]
-            (Struct(idx, arr, fields), StructOwned(r)) => {
-                struct_av_iter(*idx, arr, fields).eq_by_(r.0.iter(), |lv, rv| lv == *rv)
-            },
+            (Struct(idx, arr, _), StructOwned(r)) => struct_eq_missing(
+                struct_value_iter(*idx, arr),
+                struct_owned_value_iter(r.as_ref()),
+                null_equal,
+            ),
             #[cfg(feature = "dtype-struct")]
-            (Struct(l_idx, l_arr, l_fields), Struct(r_idx, r_arr, r_fields)) => {
-                struct_av_iter(*l_idx, l_arr, l_fields).eq(struct_av_iter(*r_idx, r_arr, r_fields))
-            },
+            (Struct(l_idx, l_arr, _), Struct(r_idx, r_arr, _)) => struct_eq_missing(
+                struct_value_iter(*l_idx, l_arr),
+                struct_value_iter(*r_idx, r_arr),
+                null_equal,
+            ),
             #[cfg(feature = "dtype-decimal")]
-            (Decimal(l_v, l_s), Decimal(r_v, r_s)) => {
-                // l_v / 10**l_s == r_v / 10**r_s
-                if l_s == r_s && l_v == r_v || *l_v == 0 && *r_v == 0 {
-                    true
-                } else if l_s < r_s {
-                    // l_v * 10**(r_s - l_s) == r_v
-                    if let Some(lhs) = (|| {
-                        let exp = i128::checked_pow(10, (r_s - l_s).try_into().ok()?)?;
-                        l_v.checked_mul(exp)
-                    })() {
-                        lhs == *r_v
-                    } else {
-                        false
-                    }
-                } else {
-                    // l_v == r_v * 10**(l_s - r_s)
-                    if let Some(rhs) = (|| {
-                        let exp = i128::checked_pow(10, (l_s - r_s).try_into().ok()?)?;
-                        r_v.checked_mul(exp)
-                    })() {
-                        *l_v == rhs
-                    } else {
-                        false
-                    }
-                }
-            },
+            (Decimal(lv, _lp, ls), Decimal(rv, _rp, rs)) => dec128_eq(*lv, *ls, *rv, *rs),
             #[cfg(feature = "object")]
             (Object(l), Object(r)) => l == r,
+            #[cfg(feature = "dtype-array")]
+            (Array(l_values, l_size), Array(r_values, r_size)) => {
+                if l_size != r_size {
+                    return false;
+                }
+
+                debug_assert_eq!(l_values.len(), *l_size);
+                debug_assert_eq!(r_values.len(), *r_size);
+
+                let mut is_equal = true;
+                for i in 0..*l_size {
+                    let l = unsafe { l_values.get_unchecked(i) };
+                    let r = unsafe { r_values.get_unchecked(i) };
+
+                    is_equal &= l.eq_missing(&r, null_equal);
+                }
+                is_equal
+            },
+
+            (l, r) if l.to_i128().is_some() && r.to_i128().is_some() => l.to_i128() == r.to_i128(),
+            (l, r) if l.to_f64().is_some() && r.to_f64().is_some() => {
+                l.to_f64().unwrap().to_total_ord() == r.to_f64().unwrap().to_total_ord()
+            },
 
             (_, _) => {
-                unimplemented!("ordering for mixed dtypes is not supported")
+                unimplemented!(
+                    "scalar eq_missing for mixed dtypes {self:?} and {other:?} is not supported"
+                )
             },
         }
     }
@@ -1236,17 +1299,13 @@ impl PartialOrd for AnyValue<'_> {
                 l.partial_cmp(&Datetime(*rv, *rtu, rtz.as_ref().map(|v| v.as_ref())))
             },
             #[cfg(feature = "dtype-categorical")]
-            (CategoricalOwned(lv, lrev, larr), r) => {
-                Categorical(*lv, lrev.as_ref(), *larr).partial_cmp(r)
-            },
+            (CategoricalOwned(cat, map), r) => Categorical(*cat, map).partial_cmp(r),
             #[cfg(feature = "dtype-categorical")]
-            (l, CategoricalOwned(rv, rrev, rarr)) => {
-                l.partial_cmp(&Categorical(*rv, rrev.as_ref(), *rarr))
-            },
+            (l, CategoricalOwned(cat, map)) => l.partial_cmp(&Categorical(*cat, map)),
             #[cfg(feature = "dtype-categorical")]
-            (EnumOwned(lv, lrev, larr), r) => Enum(*lv, lrev.as_ref(), *larr).partial_cmp(r),
+            (EnumOwned(cat, map), r) => Enum(*cat, map).partial_cmp(r),
             #[cfg(feature = "dtype-categorical")]
-            (l, EnumOwned(rv, rrev, rarr)) => l.partial_cmp(&Enum(*rv, rrev.as_ref(), *rarr)),
+            (l, EnumOwned(cat, map)) => l.partial_cmp(&Enum(*cat, map)),
 
             // Comparison with null.
             (Null, Null) => Some(Ordering::Equal),
@@ -1259,10 +1318,12 @@ impl PartialOrd for AnyValue<'_> {
             (UInt16(l), UInt16(r)) => l.partial_cmp(r),
             (UInt32(l), UInt32(r)) => l.partial_cmp(r),
             (UInt64(l), UInt64(r)) => l.partial_cmp(r),
+            (UInt128(l), UInt128(r)) => l.partial_cmp(r),
             (Int8(l), Int8(r)) => l.partial_cmp(r),
             (Int16(l), Int16(r)) => l.partial_cmp(r),
             (Int32(l), Int32(r)) => l.partial_cmp(r),
             (Int64(l), Int64(r)) => l.partial_cmp(r),
+            (Int128(l), Int128(r)) => l.partial_cmp(r),
             (Float32(l), Float32(r)) => Some(l.tot_cmp(r)),
             (Float64(l), Float64(r)) => Some(l.tot_cmp(r)),
             (String(l), String(r)) => l.partial_cmp(r),
@@ -1290,14 +1351,17 @@ impl PartialOrd for AnyValue<'_> {
             #[cfg(feature = "dtype-time")]
             (Time(l), Time(r)) => l.partial_cmp(r),
             #[cfg(feature = "dtype-categorical")]
-            (Categorical(..), Categorical(..)) => {
-                unimplemented!(
-                    "can't order categoricals as AnyValues, dtype for ordering is needed"
-                )
+            (Categorical(l_cat, l_map), Categorical(r_cat, r_map)) => unsafe {
+                let l_str = l_map.cat_to_str_unchecked(*l_cat);
+                let r_str = r_map.cat_to_str_unchecked(*r_cat);
+                l_str.partial_cmp(r_str)
             },
             #[cfg(feature = "dtype-categorical")]
-            (Enum(..), Enum(..)) => {
-                unimplemented!("can't order enums as AnyValues, dtype for ordering is needed")
+            (Enum(l_cat, l_map), Enum(r_cat, r_map)) => {
+                if !Arc::ptr_eq(l_map, r_map) {
+                    unimplemented!("can't order enums from different FrozenCategories")
+                }
+                l_cat.partial_cmp(r_cat)
             },
             (List(_), List(_)) => {
                 unimplemented!("ordering for List dtype is not supported")
@@ -1318,35 +1382,12 @@ impl PartialOrd for AnyValue<'_> {
                 unimplemented!("ordering for Struct dtype is not supported")
             },
             #[cfg(feature = "dtype-decimal")]
-            (Decimal(l_v, l_s), Decimal(r_v, r_s)) => {
-                // l_v / 10**l_s <=> r_v / 10**r_s
-                if l_s == r_s && l_v == r_v || *l_v == 0 && *r_v == 0 {
-                    Some(Ordering::Equal)
-                } else if l_s < r_s {
-                    // l_v * 10**(r_s - l_s) <=> r_v
-                    if let Some(lhs) = (|| {
-                        let exp = i128::checked_pow(10, (r_s - l_s).try_into().ok()?)?;
-                        l_v.checked_mul(exp)
-                    })() {
-                        lhs.partial_cmp(r_v)
-                    } else {
-                        Some(Ordering::Greater)
-                    }
-                } else {
-                    // l_v <=> r_v * 10**(l_s - r_s)
-                    if let Some(rhs) = (|| {
-                        let exp = i128::checked_pow(10, (l_s - r_s).try_into().ok()?)?;
-                        r_v.checked_mul(exp)
-                    })() {
-                        l_v.partial_cmp(&rhs)
-                    } else {
-                        Some(Ordering::Less)
-                    }
-                }
-            },
+            (Decimal(lv, _lp, ls), Decimal(rv, _rp, rs)) => Some(dec128_cmp(*lv, *ls, *rv, *rs)),
 
             (_, _) => {
-                unimplemented!("ordering for mixed dtypes is not supported")
+                unimplemented!(
+                    "scalar ordering for mixed dtypes {self:?} and {other:?} is not supported"
+                )
             },
         }
     }
@@ -1360,73 +1401,40 @@ impl TotalEq for AnyValue<'_> {
 }
 
 #[cfg(feature = "dtype-struct")]
-fn struct_to_avs_static(
-    idx: usize,
-    arr: &StructArray,
-    fields: &[Field],
-) -> PolarsResult<Vec<AnyValue<'static>>> {
-    let arrs = arr.values();
-    let mut avs = Vec::with_capacity(arrs.len());
-    // amortize loop counter
-    for i in 0..arrs.len() {
-        unsafe {
-            let arr = &**arrs.get_unchecked_release(i);
-            let field = fields.get_unchecked_release(i);
-            let av = arr_to_any_value(arr, idx, &field.dtype);
-            avs.push_unchecked(av.into_static()?);
-        }
-    }
-    Ok(avs)
-}
+fn struct_to_avs_static(idx: usize, arr: &StructArray, fields: &[Field]) -> Vec<AnyValue<'static>> {
+    assert!(idx < arr.len());
 
-#[cfg(feature = "dtype-categorical")]
-fn same_revmap(
-    rev_l: &RevMapping,
-    ptr_l: SyncPtr<Utf8ViewArray>,
-    rev_r: &RevMapping,
-    ptr_r: SyncPtr<Utf8ViewArray>,
-) -> bool {
-    if ptr_l.is_null() && ptr_r.is_null() {
-        match (rev_l, rev_r) {
-            (RevMapping::Global(_, _, id_l), RevMapping::Global(_, _, id_r)) => id_l == id_r,
-            (RevMapping::Local(_, id_l), RevMapping::Local(_, id_r)) => id_l == id_r,
-            _ => false,
-        }
-    } else {
-        ptr_l == ptr_r
-    }
-}
-
-#[cfg(feature = "dtype-struct")]
-fn struct_av_iter<'a>(
-    idx: usize,
-    arr: &'a StructArray,
-    fields: &'a [Field],
-) -> impl Iterator<Item = AnyValue<'a>> {
     let arrs = arr.values();
-    (0..arrs.len()).map(move |i| unsafe {
-        let arr = &**arrs.get_unchecked_release(i);
-        let field = fields.get_unchecked_release(i);
-        arr_to_any_value(arr, idx, &field.dtype)
-    })
+
+    debug_assert_eq!(arrs.len(), fields.len());
+
+    arrs.iter()
+        .zip(fields)
+        .map(|(arr, field)| {
+            // SAFETY: We asserted above that the length of StructArray is larger than `idx`. Since
+            // StructArray has the invariant that each array is the same length. This is okay to do
+            // now.
+            unsafe { arr_to_any_value(arr.as_ref(), idx, &field.dtype) }.into_static()
+        })
+        .collect()
 }
 
 pub trait GetAnyValue {
     /// # Safety
     ///
     /// Get an value without doing bound checks.
-    unsafe fn get_unchecked(&self, index: usize) -> AnyValue;
+    unsafe fn get_unchecked(&self, index: usize) -> AnyValue<'_>;
 }
 
 impl GetAnyValue for ArrayRef {
     // Should only be called with physical types
-    unsafe fn get_unchecked(&self, index: usize) -> AnyValue {
+    unsafe fn get_unchecked(&self, index: usize) -> AnyValue<'_> {
         match self.dtype() {
             ArrowDataType::Int8 => {
                 let arr = self
                     .as_any()
                     .downcast_ref::<PrimitiveArray<i8>>()
-                    .unwrap_unchecked_release();
+                    .unwrap_unchecked();
                 match arr.get_unchecked(index) {
                     None => AnyValue::Null,
                     Some(v) => AnyValue::Int8(v),
@@ -1436,7 +1444,7 @@ impl GetAnyValue for ArrayRef {
                 let arr = self
                     .as_any()
                     .downcast_ref::<PrimitiveArray<i16>>()
-                    .unwrap_unchecked_release();
+                    .unwrap_unchecked();
                 match arr.get_unchecked(index) {
                     None => AnyValue::Null,
                     Some(v) => AnyValue::Int16(v),
@@ -1446,7 +1454,7 @@ impl GetAnyValue for ArrayRef {
                 let arr = self
                     .as_any()
                     .downcast_ref::<PrimitiveArray<i32>>()
-                    .unwrap_unchecked_release();
+                    .unwrap_unchecked();
                 match arr.get_unchecked(index) {
                     None => AnyValue::Null,
                     Some(v) => AnyValue::Int32(v),
@@ -1456,17 +1464,27 @@ impl GetAnyValue for ArrayRef {
                 let arr = self
                     .as_any()
                     .downcast_ref::<PrimitiveArray<i64>>()
-                    .unwrap_unchecked_release();
+                    .unwrap_unchecked();
                 match arr.get_unchecked(index) {
                     None => AnyValue::Null,
                     Some(v) => AnyValue::Int64(v),
+                }
+            },
+            ArrowDataType::Int128 => {
+                let arr = self
+                    .as_any()
+                    .downcast_ref::<PrimitiveArray<i128>>()
+                    .unwrap_unchecked();
+                match arr.get_unchecked(index) {
+                    None => AnyValue::Null,
+                    Some(v) => AnyValue::Int128(v),
                 }
             },
             ArrowDataType::UInt8 => {
                 let arr = self
                     .as_any()
                     .downcast_ref::<PrimitiveArray<u8>>()
-                    .unwrap_unchecked_release();
+                    .unwrap_unchecked();
                 match arr.get_unchecked(index) {
                     None => AnyValue::Null,
                     Some(v) => AnyValue::UInt8(v),
@@ -1476,7 +1494,7 @@ impl GetAnyValue for ArrayRef {
                 let arr = self
                     .as_any()
                     .downcast_ref::<PrimitiveArray<u16>>()
-                    .unwrap_unchecked_release();
+                    .unwrap_unchecked();
                 match arr.get_unchecked(index) {
                     None => AnyValue::Null,
                     Some(v) => AnyValue::UInt16(v),
@@ -1486,7 +1504,7 @@ impl GetAnyValue for ArrayRef {
                 let arr = self
                     .as_any()
                     .downcast_ref::<PrimitiveArray<u32>>()
-                    .unwrap_unchecked_release();
+                    .unwrap_unchecked();
                 match arr.get_unchecked(index) {
                     None => AnyValue::Null,
                     Some(v) => AnyValue::UInt32(v),
@@ -1496,17 +1514,27 @@ impl GetAnyValue for ArrayRef {
                 let arr = self
                     .as_any()
                     .downcast_ref::<PrimitiveArray<u64>>()
-                    .unwrap_unchecked_release();
+                    .unwrap_unchecked();
                 match arr.get_unchecked(index) {
                     None => AnyValue::Null,
                     Some(v) => AnyValue::UInt64(v),
+                }
+            },
+            ArrowDataType::UInt128 => {
+                let arr = self
+                    .as_any()
+                    .downcast_ref::<PrimitiveArray<u128>>()
+                    .unwrap_unchecked();
+                match arr.get_unchecked(index) {
+                    None => AnyValue::Null,
+                    Some(v) => AnyValue::UInt128(v),
                 }
             },
             ArrowDataType::Float32 => {
                 let arr = self
                     .as_any()
                     .downcast_ref::<PrimitiveArray<f32>>()
-                    .unwrap_unchecked_release();
+                    .unwrap_unchecked();
                 match arr.get_unchecked(index) {
                     None => AnyValue::Null,
                     Some(v) => AnyValue::Float32(v),
@@ -1516,7 +1544,7 @@ impl GetAnyValue for ArrayRef {
                 let arr = self
                     .as_any()
                     .downcast_ref::<PrimitiveArray<f64>>()
-                    .unwrap_unchecked_release();
+                    .unwrap_unchecked();
                 match arr.get_unchecked(index) {
                     None => AnyValue::Null,
                     Some(v) => AnyValue::Float64(v),
@@ -1526,7 +1554,7 @@ impl GetAnyValue for ArrayRef {
                 let arr = self
                     .as_any()
                     .downcast_ref::<BooleanArray>()
-                    .unwrap_unchecked_release();
+                    .unwrap_unchecked();
                 match arr.get_unchecked(index) {
                     None => AnyValue::Null,
                     Some(v) => AnyValue::Boolean(v),
@@ -1536,7 +1564,7 @@ impl GetAnyValue for ArrayRef {
                 let arr = self
                     .as_any()
                     .downcast_ref::<LargeStringArray>()
-                    .unwrap_unchecked_release();
+                    .unwrap_unchecked();
                 match arr.get_unchecked(index) {
                     None => AnyValue::Null,
                     Some(v) => AnyValue::String(v),
@@ -1551,35 +1579,23 @@ impl<K: NumericNative> From<K> for AnyValue<'static> {
     fn from(value: K) -> Self {
         unsafe {
             match K::PRIMITIVE {
-                PrimitiveType::Int8 => {
-                    AnyValue::Int8(NumCast::from(value).unwrap_unchecked_release())
-                },
-                PrimitiveType::Int16 => {
-                    AnyValue::Int16(NumCast::from(value).unwrap_unchecked_release())
-                },
-                PrimitiveType::Int32 => {
-                    AnyValue::Int32(NumCast::from(value).unwrap_unchecked_release())
-                },
-                PrimitiveType::Int64 => {
-                    AnyValue::Int64(NumCast::from(value).unwrap_unchecked_release())
-                },
-                PrimitiveType::UInt8 => {
-                    AnyValue::UInt8(NumCast::from(value).unwrap_unchecked_release())
-                },
-                PrimitiveType::UInt16 => {
-                    AnyValue::UInt16(NumCast::from(value).unwrap_unchecked_release())
-                },
-                PrimitiveType::UInt32 => {
-                    AnyValue::UInt32(NumCast::from(value).unwrap_unchecked_release())
-                },
-                PrimitiveType::UInt64 => {
-                    AnyValue::UInt64(NumCast::from(value).unwrap_unchecked_release())
+                PrimitiveType::Int8 => AnyValue::Int8(NumCast::from(value).unwrap_unchecked()),
+                PrimitiveType::Int16 => AnyValue::Int16(NumCast::from(value).unwrap_unchecked()),
+                PrimitiveType::Int32 => AnyValue::Int32(NumCast::from(value).unwrap_unchecked()),
+                PrimitiveType::Int64 => AnyValue::Int64(NumCast::from(value).unwrap_unchecked()),
+                PrimitiveType::Int128 => AnyValue::Int128(NumCast::from(value).unwrap_unchecked()),
+                PrimitiveType::UInt8 => AnyValue::UInt8(NumCast::from(value).unwrap_unchecked()),
+                PrimitiveType::UInt16 => AnyValue::UInt16(NumCast::from(value).unwrap_unchecked()),
+                PrimitiveType::UInt32 => AnyValue::UInt32(NumCast::from(value).unwrap_unchecked()),
+                PrimitiveType::UInt64 => AnyValue::UInt64(NumCast::from(value).unwrap_unchecked()),
+                PrimitiveType::UInt128 => {
+                    AnyValue::UInt128(NumCast::from(value).unwrap_unchecked())
                 },
                 PrimitiveType::Float32 => {
-                    AnyValue::Float32(NumCast::from(value).unwrap_unchecked_release())
+                    AnyValue::Float32(NumCast::from(value).unwrap_unchecked())
                 },
                 PrimitiveType::Float64 => {
-                    AnyValue::Float64(NumCast::from(value).unwrap_unchecked_release())
+                    AnyValue::Float64(NumCast::from(value).unwrap_unchecked())
                 },
                 // not supported by polars
                 _ => unreachable!(),
@@ -1679,7 +1695,7 @@ mod test {
             (ArrowDataType::Time32(ArrowTimeUnit::Second), DataType::Time),
             (
                 ArrowDataType::List(Box::new(ArrowField::new(
-                    PlSmallStr::from_static("item"),
+                    LIST_VALUES_NAME,
                     ArrowDataType::Float64,
                     true,
                 ))),
@@ -1687,36 +1703,16 @@ mod test {
             ),
             (
                 ArrowDataType::LargeList(Box::new(ArrowField::new(
-                    PlSmallStr::from_static("item"),
+                    LIST_VALUES_NAME,
                     ArrowDataType::Float64,
                     true,
                 ))),
                 DataType::List(DataType::Float64.into()),
             ),
-            (
-                ArrowDataType::Dictionary(IntegerType::UInt32, ArrowDataType::Utf8.into(), false),
-                DataType::Categorical(None, Default::default()),
-            ),
-            (
-                ArrowDataType::Dictionary(
-                    IntegerType::UInt32,
-                    ArrowDataType::LargeUtf8.into(),
-                    false,
-                ),
-                DataType::Categorical(None, Default::default()),
-            ),
-            (
-                ArrowDataType::Dictionary(
-                    IntegerType::UInt64,
-                    ArrowDataType::LargeUtf8.into(),
-                    false,
-                ),
-                DataType::Categorical(None, Default::default()),
-            ),
         ];
 
         for (dt_a, dt_p) in dtypes {
-            let dt: DataType = (&dt_a).into();
+            let dt = DataType::from_arrow_dtype(&dt_a);
 
             assert_eq!(dt_p, dt);
         }

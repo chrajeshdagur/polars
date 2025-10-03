@@ -2,7 +2,7 @@ use super::*;
 
 impl DataFrame {
     /// Get a row from a [`DataFrame`]. Use of this is discouraged as it will likely be slow.
-    pub fn get_row(&self, idx: usize) -> PolarsResult<Row> {
+    pub fn get_row(&self, idx: usize) -> PolarsResult<Row<'_>> {
         let values = self
             .materialized_column_iter()
             .map(|s| s.get(idx))
@@ -51,6 +51,12 @@ impl DataFrame {
     where
         I: Iterator<Item = &'a Row<'a>>,
     {
+        if schema.is_empty() {
+            let height = rows.count();
+            let columns = Vec::new();
+            return Ok(unsafe { DataFrame::new_no_checks(height, columns) });
+        }
+
         let capacity = rows.size_hint().0;
 
         let mut buffers: Vec<_> = schema

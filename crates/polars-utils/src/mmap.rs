@@ -1,5 +1,8 @@
+use std::ffi::c_void;
 use std::fs::File;
 use std::io;
+use std::mem::ManuallyDrop;
+use std::sync::LazyLock;
 
 pub use memmap::Mmap;
 
@@ -11,7 +14,7 @@ mod private {
     use polars_error::PolarsResult;
 
     use super::MMapSemaphore;
-    use crate::mem::prefetch_l2;
+    use crate::mem::prefetch::prefetch_l2;
 
     /// A read-only reference to a slice of memory that can potentially be memory-mapped.
     ///
@@ -35,8 +38,8 @@ mod private {
     #[derive(Clone, Debug)]
     #[allow(unused)]
     enum MemSliceInner {
-        Bytes(bytes::Bytes),
-        Mmap(Arc<MMapSemaphore>),
+        Bytes(bytes::Bytes), // Separate because it does atomic refcounting internally
+        Arc(Arc<dyn std::fmt::Debug + Send + Sync>),
     }
 
     impl Deref for MemSlice {
@@ -58,6 +61,12 @@ mod private {
     impl Default for MemSlice {
         fn default() -> Self {
             Self::from_bytes(bytes::Bytes::new())
+        }
+    }
+
+    impl From<Vec<u8>> for MemSlice {
+        fn from(value: Vec<u8>) -> Self {
+            Self::from_vec(value)
         }
     }
 
@@ -91,7 +100,18 @@ mod private {
                 slice: unsafe {
                     std::mem::transmute::<&[u8], &'static [u8]>(mmap.as_ref().as_ref())
                 },
-                inner: MemSliceInner::Mmap(mmap),
+                inner: MemSliceInner::Arc(mmap),
+            }
+        }
+
+        #[inline]
+        pub fn from_arc<T>(slice: &[u8], arc: Arc<T>) -> Self
+        where
+            T: std::fmt::Debug + Send + Sync + 'static,
+        {
+            Self {
+                slice: unsafe { std::mem::transmute::<&[u8], &'static [u8]>(slice) },
+                inner: MemSliceInner::Arc(arc),
             }
         }
 
@@ -124,13 +144,22 @@ mod private {
             out
         }
     }
+
+    impl From<bytes::Bytes> for MemSlice {
+        fn from(value: bytes::Bytes) -> Self {
+            Self::from_bytes(value)
+        }
+    }
 }
 
 use memmap::MmapOptions;
+use polars_error::PolarsResult;
 #[cfg(target_family = "unix")]
 use polars_error::polars_bail;
-use polars_error::PolarsResult;
 pub use private::MemSlice;
+use rayon::{ThreadPool, ThreadPoolBuilder};
+
+use crate::mem::PAGE_SIZE;
 
 /// A cursor over a [`MemSlice`].
 #[derive(Debug, Clone)]
@@ -215,20 +244,14 @@ impl io::Seek for MemReader {
             io::SeekFrom::Start(position) => usize::min(position as usize, self.total_len()),
             io::SeekFrom::End(offset) => {
                 let Some(position) = self.total_len().checked_add_signed(offset as isize) else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "Seek before to before buffer",
-                    ));
+                    return Err(io::Error::other("Seek before to before buffer"));
                 };
 
                 position
             },
             io::SeekFrom::Current(offset) => {
                 let Some(position) = self.position.checked_add_signed(offset as isize) else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "Seek before to before buffer",
-                    ));
+                    return Err(io::Error::other("Seek before to before buffer"));
                 };
 
                 position
@@ -241,19 +264,79 @@ impl io::Seek for MemReader {
     }
 }
 
+pub static UNMAP_POOL: LazyLock<ThreadPool> = LazyLock::new(|| {
+    let thread_name = std::env::var("POLARS_THREAD_NAME").unwrap_or_else(|_| "polars".to_string());
+    ThreadPoolBuilder::new()
+        .num_threads(1)
+        .thread_name(move |i| format!("{thread_name}-unmap-{i}"))
+        .build()
+        .expect("could not spawn threads")
+});
+
 // Keep track of memory mapped files so we don't write to them while reading
 // Use a btree as it uses less memory than a hashmap and this thing never shrinks.
 // Write handle in Windows is exclusive, so this is only necessary in Unix.
 #[cfg(target_family = "unix")]
-static MEMORY_MAPPED_FILES: once_cell::sync::Lazy<
+static MEMORY_MAPPED_FILES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::BTreeMap<(u64, u64), u32>>,
-> = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(Default::default()));
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(Default::default()));
 
 #[derive(Debug)]
 pub struct MMapSemaphore {
     #[cfg(target_family = "unix")]
     key: (u64, u64),
-    mmap: Mmap,
+    mmap: ManuallyDrop<Mmap>,
+}
+
+impl Drop for MMapSemaphore {
+    fn drop(&mut self) {
+        #[cfg(target_family = "unix")]
+        {
+            let mut guard = MEMORY_MAPPED_FILES.lock().unwrap();
+            if let std::collections::btree_map::Entry::Occupied(mut e) = guard.entry(self.key) {
+                let v = e.get_mut();
+                *v -= 1;
+
+                if *v == 0 {
+                    e.remove_entry();
+                }
+            }
+        }
+
+        unsafe {
+            let mmap = ManuallyDrop::take(&mut self.mmap);
+            // If the unmap is 1 MiB or bigger, we do it in a background thread.
+            let len = self.mmap.len();
+            if len >= 1024 * 1024 {
+                UNMAP_POOL.spawn(move || {
+                    #[cfg(target_family = "unix")]
+                    {
+                        // If the unmap is bigger than our chunk size (32 MiB), we do it in chunks.
+                        // This is because munmap holds a lock on the unmap file, which we don't
+                        // want to hold for extended periods of time.
+                        let chunk_size = (32_usize * 1024 * 1024).next_multiple_of(*PAGE_SIZE);
+                        if len > chunk_size {
+                            let mmap = ManuallyDrop::new(mmap);
+                            let ptr: *const u8 = mmap.as_ptr();
+                            let mut offset = 0;
+                            while offset < len {
+                                let remaining = len - offset;
+                                libc::munmap(
+                                    ptr.add(offset) as *mut c_void,
+                                    remaining.min(chunk_size),
+                                );
+                                offset += chunk_size;
+                            }
+                            return;
+                        }
+                    }
+                    drop(mmap)
+                });
+            } else {
+                drop(mmap);
+            }
+        }
+    }
 }
 
 impl MMapSemaphore {
@@ -261,10 +344,23 @@ impl MMapSemaphore {
         file: &File,
         options: MmapOptions,
     ) -> PolarsResult<MMapSemaphore> {
-        let mmap = unsafe { options.map(file) }?;
+        let mmap = match unsafe { options.map(file) } {
+            Ok(m) => m,
+
+            // Mmap can fail with ENODEV on filesystems which don't support
+            // MAP_SHARED, try MAP_PRIVATE instead, see #24343.
+            #[cfg(target_family = "unix")]
+            Err(e) if e.raw_os_error() == Some(libc::ENODEV) => unsafe {
+                options.map_copy_read_only(file)?
+            },
+
+            Err(e) => return Err(e.into()),
+        };
 
         #[cfg(target_family = "unix")]
         {
+            // FIXME: We aren't handling the case where the file is already open in write-mode here.
+
             use std::os::unix::fs::MetadataExt;
             let metadata = file.metadata()?;
 
@@ -274,11 +370,16 @@ impl MMapSemaphore {
                 std::collections::btree_map::Entry::Occupied(mut e) => *e.get_mut() += 1,
                 std::collections::btree_map::Entry::Vacant(e) => _ = e.insert(1),
             }
-            Ok(Self { key, mmap })
+            Ok(Self {
+                key,
+                mmap: ManuallyDrop::new(mmap),
+            })
         }
 
         #[cfg(not(target_family = "unix"))]
-        Ok(Self { mmap })
+        Ok(Self {
+            mmap: ManuallyDrop::new(mmap),
+        })
     }
 
     pub fn new_from_file(file: &File) -> PolarsResult<MMapSemaphore> {
@@ -297,28 +398,16 @@ impl AsRef<[u8]> for MMapSemaphore {
     }
 }
 
-#[cfg(target_family = "unix")]
-impl Drop for MMapSemaphore {
-    fn drop(&mut self) {
-        let mut guard = MEMORY_MAPPED_FILES.lock().unwrap();
-        if let std::collections::btree_map::Entry::Occupied(mut e) = guard.entry(self.key) {
-            let v = e.get_mut();
-            *v -= 1;
-
-            if *v == 0 {
-                e.remove_entry();
-            }
-        }
-    }
-}
-
-pub fn ensure_not_mapped(#[allow(unused)] file: &File) -> PolarsResult<()> {
+pub fn ensure_not_mapped(
+    #[cfg_attr(not(target_family = "unix"), allow(unused))] file_md: &std::fs::Metadata,
+) -> PolarsResult<()> {
+    // TODO: We need to actually register that this file has been write-opened and prevent
+    // read-opening this file based on that.
     #[cfg(target_family = "unix")]
     {
         use std::os::unix::fs::MetadataExt;
         let guard = MEMORY_MAPPED_FILES.lock().unwrap();
-        let metadata = file.metadata()?;
-        if guard.contains_key(&(metadata.dev(), metadata.ino())) {
+        if guard.contains_key(&(file_md.dev(), file_md.ino())) {
             polars_bail!(ComputeError: "cannot write to file: already memory mapped");
         }
     }

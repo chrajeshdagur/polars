@@ -3,9 +3,9 @@ use arrow::bitmap::Bitmap;
 use arrow::offset::Offset;
 use polars_error::PolarsResult;
 
-use super::super::{utils, WriteOptions};
+use super::super::{WriteOptions, utils};
 use crate::arrow::read::schema::is_nullable;
-use crate::parquet::encoding::{delta_bitpacked, Encoding};
+use crate::parquet::encoding::{Encoding, delta_bitpacked};
 use crate::parquet::schema::types::PrimitiveType;
 use crate::parquet::statistics::{BinaryStatistics, ParquetStatistics};
 use crate::write::utils::invalid_encoding;
@@ -30,15 +30,15 @@ pub(crate) fn encode_plain<O: Offset>(
 ) {
     if options.is_optional() && array.validity().is_some() {
         let len_before = buffer.len();
-        let capacity = array.get_values_size()
-            + (array.len() - array.null_count()) * std::mem::size_of::<u32>();
+        let capacity =
+            array.get_values_size() + (array.len() - array.null_count()) * size_of::<u32>();
         buffer.reserve(capacity);
         encode_non_null_values(array.non_null_values_iter(), buffer);
         // Ensure we allocated properly.
         debug_assert_eq!(buffer.len() - len_before, capacity);
     } else {
         let len_before = buffer.len();
-        let capacity = array.get_values_size() + array.len() * std::mem::size_of::<u32>();
+        let capacity = array.get_values_size() + array.len() * size_of::<u32>();
         buffer.reserve(capacity);
         encode_non_null_values(array.values_iter(), buffer);
         // Ensure we allocated properly.

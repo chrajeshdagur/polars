@@ -3,14 +3,14 @@ use crate::bitmap::Bitmap;
 use crate::buffer::Buffer;
 use crate::datatypes::ArrowDataType;
 
-#[cfg(feature = "arrow_rs")]
-mod data;
+mod builder;
 mod ffi;
 pub(super) mod fmt;
 mod iterator;
+pub use builder::*;
 mod mutable;
 pub use mutable::*;
-use polars_error::{polars_bail, polars_ensure, PolarsResult};
+use polars_error::{PolarsResult, polars_bail, polars_ensure};
 
 /// The Arrow's equivalent to an immutable `Vec<Option<[u8; size]>>`.
 /// Cloning and slicing this struct is `O(1)`.
@@ -37,7 +37,7 @@ impl FixedSizeBinaryArray {
     ) -> PolarsResult<Self> {
         let size = Self::maybe_get_size(&dtype)?;
 
-        if values.len() % size != 0 {
+        if !values.len().is_multiple_of(size) {
             polars_bail!(ComputeError:
                 "values (of len {}) must be a multiple of size ({}) in FixedSizeBinaryArray.",
                 values.len(),
@@ -48,7 +48,7 @@ impl FixedSizeBinaryArray {
 
         if validity
             .as_ref()
-            .map_or(false, |validity| validity.len() != len)
+            .is_some_and(|validity| validity.len() != len)
         {
             polars_bail!(ComputeError: "validity mask length must be equal to the number of values divided by size")
         }
@@ -84,6 +84,10 @@ impl FixedSizeBinaryArray {
             vec![0u8; length * size].into(),
             Some(Bitmap::new_zeroed(length)),
         )
+    }
+
+    pub fn into_inner(self) -> (ArrowDataType, Buffer<u8>, Option<Bitmap>) {
+        (self.dtype, self.values, self.validity)
     }
 }
 

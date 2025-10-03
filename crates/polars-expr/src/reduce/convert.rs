@@ -1,88 +1,130 @@
-use polars_core::error::feature_gated;
+// use polars_core::error::feature_gated;
 use polars_plan::prelude::*;
 use polars_utils::arena::{Arena, Node};
 
-use super::len::LenReduce;
-use super::mean::MeanReduce;
-use super::min_max::{MaxReduce, MinReduce};
-#[cfg(feature = "propagate_nans")]
-use super::nan_min_max::{NanMaxReduce, NanMinReduce};
-use super::sum::SumReduce;
 use super::*;
+use crate::reduce::any_all::{new_all_reduction, new_any_reduction};
+#[cfg(feature = "bitwise")]
+use crate::reduce::bitwise::{
+    new_bitwise_and_reduction, new_bitwise_or_reduction, new_bitwise_xor_reduction,
+};
+use crate::reduce::count::{CountReduce, NullCountReduce};
+use crate::reduce::first_last::{new_first_reduction, new_last_reduction};
+use crate::reduce::len::LenReduce;
+use crate::reduce::mean::new_mean_reduction;
+use crate::reduce::min_max::{new_max_reduction, new_min_reduction};
+use crate::reduce::sum::new_sum_reduction;
+use crate::reduce::var_std::new_var_std_reduction;
 
 /// Converts a node into a reduction + its associated selector expression.
 pub fn into_reduction(
     node: Node,
     expr_arena: &mut Arena<AExpr>,
     schema: &Schema,
-) -> PolarsResult<(Box<dyn Reduction>, Node)> {
+) -> PolarsResult<(Box<dyn GroupedReduction>, Node)> {
     let get_dt = |node| {
         expr_arena
             .get(node)
-            .to_dtype(schema, Context::Default, expr_arena)
+            .to_dtype(&ToFieldContext::new(expr_arena, schema))?
+            .materialize_unknown(false)
     };
     let out = match expr_arena.get(node) {
         AExpr::Agg(agg) => match agg {
-            IRAggExpr::Sum(input) => (
-                Box::new(SumReduce::new(get_dt(*input)?)) as Box<dyn Reduction>,
-                *input,
-            ),
+            IRAggExpr::Sum(input) => (new_sum_reduction(get_dt(*input)?)?, *input),
+            IRAggExpr::Mean(input) => (new_mean_reduction(get_dt(*input)?)?, *input),
             IRAggExpr::Min {
                 propagate_nans,
                 input,
-            } => {
-                let dt = get_dt(*input)?;
-                if *propagate_nans && dt.is_float() {
-                    feature_gated!("propagate_nans", {
-                        let out: Box<dyn Reduction> = match dt {
-                            DataType::Float32 => Box::new(NanMinReduce::<Float32Type>::new()),
-                            DataType::Float64 => Box::new(NanMinReduce::<Float64Type>::new()),
-                            _ => unreachable!(),
-                        };
-                        (out, *input)
-                    })
-                } else {
-                    (
-                        Box::new(MinReduce::new(dt.clone())) as Box<dyn Reduction>,
-                        *input,
-                    )
-                }
-            },
+            } => (new_min_reduction(get_dt(*input)?, *propagate_nans)?, *input),
             IRAggExpr::Max {
                 propagate_nans,
                 input,
+            } => (new_max_reduction(get_dt(*input)?, *propagate_nans)?, *input),
+            IRAggExpr::Var(input, ddof) => (
+                new_var_std_reduction(get_dt(*input)?, false, *ddof)?,
+                *input,
+            ),
+            IRAggExpr::Std(input, ddof) => {
+                (new_var_std_reduction(get_dt(*input)?, true, *ddof)?, *input)
+            },
+            IRAggExpr::First(input) => (new_first_reduction(get_dt(*input)?), *input),
+            IRAggExpr::Last(input) => (new_last_reduction(get_dt(*input)?), *input),
+            IRAggExpr::Count {
+                input,
+                include_nulls,
             } => {
-                let dt = get_dt(*input)?;
-                if *propagate_nans && dt.is_float() {
-                    feature_gated!("propagate_nans", {
-                        let out: Box<dyn Reduction> = match dt {
-                            DataType::Float32 => Box::new(NanMaxReduce::<Float32Type>::new()),
-                            DataType::Float64 => Box::new(NanMaxReduce::<Float64Type>::new()),
-                            _ => unreachable!(),
-                        };
-                        (out, *input)
-                    })
-                } else {
-                    (Box::new(MaxReduce::new(dt.clone())) as _, *input)
-                }
+                let count = Box::new(CountReduce::new(*include_nulls)) as Box<_>;
+                (count, *input)
             },
-            IRAggExpr::Mean(input) => {
-                let out: Box<dyn Reduction> = Box::new(MeanReduce::new(get_dt(*input)?));
-                (out, *input)
-            },
-            _ => unreachable!(),
+            IRAggExpr::Quantile { .. } => todo!(),
+            IRAggExpr::Median(_) => todo!(),
+            IRAggExpr::NUnique(_) => todo!(),
+            IRAggExpr::Implode(_) => todo!(),
+            IRAggExpr::AggGroups(_) => todo!(),
         },
         AExpr::Len => {
-            // Compute length on the first column, or if none exist we'll use
-            // a zero-length dummy series.
-            let out: Box<dyn Reduction> = Box::new(LenReduce::new());
-            let expr = if let Some(first_column) = schema.iter_names().next() {
-                expr_arena.add(AExpr::Column(first_column.as_str().into()))
+            if let Some(first_column) = schema.iter_names().next() {
+                let out: Box<dyn GroupedReduction> = Box::new(LenReduce::default());
+                let expr = expr_arena.add(AExpr::Column(first_column.as_str().into()));
+
+                (out, expr)
             } else {
-                let dummy = Series::new_null(PlSmallStr::from_static("dummy"), 0);
-                expr_arena.add(AExpr::Literal(LiteralValue::Series(SpecialEq::new(dummy))))
-            };
-            (out, expr)
+                // Support len aggregation on 0-width morsels.
+                // Notes:
+                // * We do this instead of projecting a scalar, because scalar literals don't
+                //   project to the height of the DataFrame (in the PhysicalExpr impl).
+                // * This approach is not sound for `update_groups()`, but currently that case is
+                //   not hit (it would need group-by -> len on empty morsels).
+                let out: Box<dyn GroupedReduction> = new_sum_reduction(DataType::IDX_DTYPE)?;
+                let expr = expr_arena.add(AExpr::Len);
+
+                (out, expr)
+            }
+        },
+
+        AExpr::Function {
+            input: inner_exprs,
+            function: IRFunctionExpr::NullCount,
+            options: _,
+        } => {
+            assert!(inner_exprs.len() == 1);
+            let input = inner_exprs[0].node();
+            let count = Box::new(NullCountReduce::new()) as Box<_>;
+            (count, input)
+        },
+
+        #[cfg(feature = "bitwise")]
+        AExpr::Function {
+            input: inner_exprs,
+            function: IRFunctionExpr::Bitwise(inner_fn),
+            options: _,
+        } => {
+            assert!(inner_exprs.len() == 1);
+            let input = inner_exprs[0].node();
+            match inner_fn {
+                IRBitwiseFunction::And => (new_bitwise_and_reduction(get_dt(input)?), input),
+                IRBitwiseFunction::Or => (new_bitwise_or_reduction(get_dt(input)?), input),
+                IRBitwiseFunction::Xor => (new_bitwise_xor_reduction(get_dt(input)?), input),
+                _ => unreachable!(),
+            }
+        },
+
+        AExpr::Function {
+            input: inner_exprs,
+            function: IRFunctionExpr::Boolean(inner_fn),
+            options: _,
+        } => {
+            assert!(inner_exprs.len() == 1);
+            let input = inner_exprs[0].node();
+            match inner_fn {
+                IRBooleanFunction::Any { ignore_nulls } => {
+                    (new_any_reduction(*ignore_nulls), input)
+                },
+                IRBooleanFunction::All { ignore_nulls } => {
+                    (new_all_reduction(*ignore_nulls), input)
+                },
+                _ => unreachable!(),
+            }
         },
         _ => unreachable!(),
     };

@@ -5,7 +5,11 @@ mod serialize;
 mod stream;
 pub(crate) mod writer;
 
-pub use common::{Compression, Record, WriteOptions};
+pub use common::{
+    Compression, DictionaryTracker, EncodedData, Record, WriteOptions, commit_encoded_arrays,
+    dictionaries_to_encode, encode_array, encode_dictionary, encode_new_dictionaries,
+    encode_record_batch,
+};
 pub use schema::schema_to_bytes;
 pub use serialize::write;
 use serialize::write_dictionary;
@@ -13,16 +17,6 @@ pub use stream::StreamWriter;
 pub use writer::FileWriter;
 
 pub(crate) mod common_sync;
-
-#[cfg(feature = "io_ipc_write_async")]
-mod common_async;
-#[cfg(feature = "io_ipc_write_async")]
-#[cfg_attr(docsrs, doc(cfg(feature = "io_ipc_write_async")))]
-pub mod stream_async;
-
-#[cfg(feature = "io_ipc_write_async")]
-#[cfg_attr(docsrs, doc(cfg(feature = "io_ipc_write_async")))]
-pub mod file_async;
 
 use super::IpcField;
 use crate::datatypes::{ArrowDataType, Field};
@@ -36,8 +30,17 @@ fn default_ipc_field(dtype: &ArrowDataType, current_id: &mut i64) -> IpcField {
             dictionary_id: None,
         },
         // multiple children => recurse
-        Union(fields, ..) | Struct(fields) => IpcField {
+        Struct(fields) => IpcField {
             fields: fields
+                .iter()
+                .map(|f| default_ipc_field(f.dtype(), current_id))
+                .collect(),
+            dictionary_id: None,
+        },
+        // multiple children => recurse
+        Union(u) => IpcField {
+            fields: u
+                .fields
                 .iter()
                 .map(|f| default_ipc_field(f.dtype(), current_id))
                 .collect(),

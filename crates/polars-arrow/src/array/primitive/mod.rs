@@ -4,25 +4,27 @@ use either::Either;
 
 use super::{Array, Splitable};
 use crate::array::iterator::NonNullValuesIter;
-use crate::bitmap::utils::{BitmapIter, ZipValidity};
 use crate::bitmap::Bitmap;
+use crate::bitmap::utils::{BitmapIter, ZipValidity};
 use crate::buffer::Buffer;
 use crate::datatypes::*;
 use crate::trusted_len::TrustedLen;
-use crate::types::{days_ms, f16, i256, months_days_ns, NativeType};
+use crate::types::{NativeType, days_ms, f16, i256, months_days_ns};
 
-#[cfg(feature = "arrow_rs")]
-mod data;
 mod ffi;
 pub(super) mod fmt;
 mod from_natural;
 pub mod iterator;
+#[cfg(feature = "proptest")]
+pub mod proptest;
 
 mod mutable;
 pub use mutable::*;
-use polars_error::{polars_bail, PolarsResult};
+mod builder;
+pub use builder::*;
+use polars_error::{PolarsResult, polars_bail};
 use polars_utils::index::{Bounded, Indexable, NullCount};
-use polars_utils::slice::{GetSaferUnchecked, SliceAble};
+use polars_utils::slice::SliceAble;
 
 /// A [`PrimitiveArray`] is Arrow's semantically equivalent of an immutable `Vec<Option<T>>` where
 /// T is [`NativeType`] (e.g. [`i32`]). It implements [`Array`].
@@ -61,7 +63,7 @@ pub(super) fn check<T: NativeType>(
     values: &[T],
     validity_len: Option<usize>,
 ) -> PolarsResult<()> {
-    if validity_len.map_or(false, |len| len != values.len()) {
+    if validity_len.is_some_and(|len| len != values.len()) {
         polars_bail!(ComputeError: "validity mask length must match the number of values")
     }
 
@@ -100,6 +102,10 @@ impl<T: NativeType> PrimitiveArray<T> {
         values: Buffer<T>,
         validity: Option<Bitmap>,
     ) -> Self {
+        if cfg!(debug_assertions) {
+            check(&dtype, &values, validity.as_ref().map(|v| v.len())).unwrap();
+        }
+
         Self {
             dtype,
             values,
@@ -155,13 +161,13 @@ impl<T: NativeType> PrimitiveArray<T> {
 
     /// Returns an iterator over the values and validity, `Option<&T>`.
     #[inline]
-    pub fn iter(&self) -> ZipValidity<&T, std::slice::Iter<T>, BitmapIter> {
+    pub fn iter(&self) -> ZipValidity<&T, std::slice::Iter<'_, T>, BitmapIter<'_>> {
         ZipValidity::new_with_validity(self.values().iter(), self.validity())
     }
 
     /// Returns an iterator of the values, `&T`, ignoring the arrays' validity.
     #[inline]
-    pub fn values_iter(&self) -> std::slice::Iter<T> {
+    pub fn values_iter(&self) -> std::slice::Iter<'_, T> {
         self.values().iter()
     }
 
@@ -213,7 +219,7 @@ impl<T: NativeType> PrimitiveArray<T> {
     /// Caller must be sure that `i < self.len()`
     #[inline]
     pub unsafe fn value_unchecked(&self, i: usize) -> T {
-        *self.values.get_unchecked_release(i)
+        *self.values.get_unchecked(i)
     }
 
     // /// Returns the element at index `i` or `None` if it is null
@@ -309,8 +315,8 @@ impl<T: NativeType> PrimitiveArray<T> {
         (dtype, values, validity)
     }
 
-    /// Creates a `[PrimitiveArray]` from its internal representation.
-    /// This is the inverted from `[PrimitiveArray::into_inner]`
+    /// Creates a [`PrimitiveArray`] from its internal representation.
+    /// This is the inverted from [`PrimitiveArray::into_inner`]
     pub fn from_inner(
         dtype: ArrowDataType,
         values: Buffer<T>,
@@ -320,8 +326,8 @@ impl<T: NativeType> PrimitiveArray<T> {
         Ok(unsafe { Self::from_inner_unchecked(dtype, values, validity) })
     }
 
-    /// Creates a `[PrimitiveArray]` from its internal representation.
-    /// This is the inverted from `[PrimitiveArray::into_inner]`
+    /// Creates a [`PrimitiveArray`] from its internal representation.
+    /// This is the inverted from [`PrimitiveArray::into_inner`]
     ///
     /// # Safety
     /// Callers must ensure all invariants of this struct are upheld.
@@ -452,13 +458,11 @@ impl<T: NativeType> PrimitiveArray<T> {
         let PrimitiveArray {
             values, validity, ..
         } = self;
-
-        // SAFETY: this is fine, we checked size and alignment, and NativeType
-        // is always Pod.
-        assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<U>());
-        assert_eq!(std::mem::align_of::<T>(), std::mem::align_of::<U>());
-        let new_values = unsafe { std::mem::transmute::<Buffer<T>, Buffer<U>>(values) };
-        PrimitiveArray::new(U::PRIMITIVE.into(), new_values, validity)
+        PrimitiveArray::new(
+            U::PRIMITIVE.into(),
+            Buffer::try_transmute::<U>(values).unwrap(),
+            validity,
+        )
     }
 
     /// Fills this entire array with the given value, leaving the validity mask intact.
@@ -576,6 +580,8 @@ pub type UInt16Array = PrimitiveArray<u16>;
 pub type UInt32Array = PrimitiveArray<u32>;
 /// A type definition [`PrimitiveArray`] for `u64`
 pub type UInt64Array = PrimitiveArray<u64>;
+/// A type definition [`PrimitiveArray`] for `u128`
+pub type UInt128Array = PrimitiveArray<u128>;
 
 /// A type definition [`MutablePrimitiveArray`] for `i8`
 pub type Int8Vec = MutablePrimitiveArray<i8>;
@@ -607,6 +613,8 @@ pub type UInt16Vec = MutablePrimitiveArray<u16>;
 pub type UInt32Vec = MutablePrimitiveArray<u32>;
 /// A type definition [`MutablePrimitiveArray`] for `u64`
 pub type UInt64Vec = MutablePrimitiveArray<u64>;
+/// A type definition [`MutablePrimitiveArray`] for `u128`
+pub type UInt128Vec = MutablePrimitiveArray<u128>;
 
 impl<T: NativeType> Default for PrimitiveArray<T> {
     fn default() -> Self {

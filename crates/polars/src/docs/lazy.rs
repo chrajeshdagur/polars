@@ -1,7 +1,7 @@
 //!
 //! # Polars Lazy cookbook
 //!
-//! This page should serve a cookbook to quickly get you started with polars' query engine.
+//! This page should serve as a cookbook to quickly get you started with Polars' query engine.
 //! The lazy API allows you to create complex well performing queries on top of Polars eager.
 //!
 //! ## Tree Of Contents
@@ -103,7 +103,7 @@
 //!
 //! ## Groupby
 //!
-//! This example is from the polars [user guide](https://docs.pola.rs/user-guide/concepts/contexts/#group_by-aggregation).
+//! This example is from the polars [user guide](https://docs.pola.rs/user-guide/concepts/expressions-and-contexts/#group_by-and-aggregations).
 //!
 //! ```
 //! use polars::prelude::*;
@@ -257,7 +257,7 @@
 //!         "b" => [3.0f32, 5.1, 0.3]
 //!     ]?
 //!     .lazy()
-//!     .select([as_struct(&[col("a"), col("b")]).map(
+//!     .select([as_struct(vec![col("a"), col("b")]).map(
 //!         |s| {
 //!             let ca = s.struct_()?;
 //!
@@ -277,7 +277,7 @@
 //!
 //!             Ok(Some(out.into_series()))
 //!         },
-//!         GetOutput::from_type(DataType::Float32),
+//!         |_, f| Ok(Field::new(f.name().clone(), DataType::Float32))
 //!     )])
 //!     .collect()
 //! }

@@ -1,16 +1,20 @@
 use arrow::array::MutableBinaryViewArray;
+#[cfg(feature = "dtype-decimal")]
+use polars_compute::decimal::str_to_dec128;
+#[cfg(feature = "dtype-categorical")]
+use polars_core::chunked_array::builder::CategoricalChunkedBuilder;
 use polars_core::prelude::*;
 use polars_error::to_compute_err;
 #[cfg(any(feature = "dtype-datetime", feature = "dtype-date"))]
 use polars_time::chunkedarray::string::Pattern;
 #[cfg(any(feature = "dtype-datetime", feature = "dtype-date"))]
 use polars_time::prelude::string::infer::{
-    infer_pattern_single, DatetimeInfer, StrpTimeParser, TryFromWithUnit,
+    DatetimeInfer, StrpTimeParser, TryFromWithUnit, infer_pattern_single,
 };
 use polars_utils::vec::PushUnchecked;
 
 use super::options::CsvEncoding;
-use super::parser::{is_whitespace, skip_whitespace};
+use super::parser::{could_be_whitespace_fast, skip_whitespace};
 use super::utils::escape_field;
 
 pub(crate) trait PrimitiveParser: PolarsNumericType {
@@ -20,13 +24,13 @@ pub(crate) trait PrimitiveParser: PolarsNumericType {
 impl PrimitiveParser for Float32Type {
     #[inline]
     fn parse(bytes: &[u8]) -> Option<f32> {
-        fast_float::parse(bytes).ok()
+        fast_float2::parse(bytes).ok()
     }
 }
 impl PrimitiveParser for Float64Type {
     #[inline]
     fn parse(bytes: &[u8]) -> Option<f64> {
-        fast_float::parse(bytes).ok()
+        fast_float2::parse(bytes).ok()
     }
 }
 
@@ -56,6 +60,13 @@ impl PrimitiveParser for UInt64Type {
         atoi_simd::parse_skipped(bytes).ok()
     }
 }
+#[cfg(feature = "dtype-u128")]
+impl PrimitiveParser for UInt128Type {
+    #[inline]
+    fn parse(bytes: &[u8]) -> Option<u128> {
+        atoi_simd::parse_skipped(bytes).ok()
+    }
+}
 #[cfg(feature = "dtype-i8")]
 impl PrimitiveParser for Int8Type {
     #[inline]
@@ -82,6 +93,13 @@ impl PrimitiveParser for Int64Type {
         atoi_simd::parse_skipped(bytes).ok()
     }
 }
+#[cfg(feature = "dtype-i128")]
+impl PrimitiveParser for Int128Type {
+    #[inline]
+    fn parse(bytes: &[u8]) -> Option<i128> {
+        atoi_simd::parse_skipped(bytes).ok()
+    }
+}
 
 trait ParsedBuffer {
     fn parse_bytes(
@@ -101,46 +119,34 @@ where
     #[inline]
     fn parse_bytes(
         &mut self,
-        bytes: &[u8],
+        mut bytes: &[u8],
         ignore_errors: bool,
         needs_escaping: bool,
         _missing_is_null: bool,
         _time_unit: Option<TimeUnit>,
     ) -> PolarsResult<()> {
+        if !bytes.is_empty() && needs_escaping {
+            bytes = &bytes[1..bytes.len() - 1];
+        }
+
+        if !bytes.is_empty() && could_be_whitespace_fast(bytes[0]) {
+            bytes = skip_whitespace(bytes);
+        }
+
         if bytes.is_empty() {
-            self.append_null()
-        } else {
-            let bytes = if needs_escaping {
-                &bytes[1..bytes.len() - 1]
-            } else {
-                bytes
-            };
+            self.append_null();
+            return Ok(());
+        }
 
-            // legacy comment (remember this if you decide to use Results again):
-            // its faster to work on options.
-            // if we need to throw an error, we parse again to be able to throw the error
-
-            match T::parse(bytes) {
-                Some(value) => self.append_value(value),
-                None => {
-                    // try again without whitespace
-                    if !bytes.is_empty() && is_whitespace(bytes[0]) {
-                        let bytes = skip_whitespace(bytes);
-                        return self.parse_bytes(
-                            bytes,
-                            ignore_errors,
-                            false, // escaping was already done
-                            _missing_is_null,
-                            None,
-                        );
-                    }
-                    polars_ensure!(
-                        bytes.is_empty() || ignore_errors,
-                        ComputeError: "remaining bytes non-empty",
-                    );
+        match T::parse(bytes) {
+            Some(value) => self.append_value(value),
+            None => {
+                if ignore_errors {
                     self.append_null()
-                },
-            };
+                } else {
+                    polars_bail!(ComputeError: "invalid primitive value found during CSV parsing")
+                }
+            },
         }
         Ok(())
     }
@@ -148,7 +154,7 @@ where
 
 pub struct Utf8Field {
     name: PlSmallStr,
-    mutable: MutableBinaryViewArray<str>,
+    mutable: MutableBinaryViewArray<[u8]>,
     scratch: Vec<u8>,
     quote_char: u8,
     encoding: CsvEncoding,
@@ -172,7 +178,7 @@ impl Utf8Field {
 }
 
 #[inline]
-fn validate_utf8(bytes: &[u8]) -> bool {
+pub fn validate_utf8(bytes: &[u8]) -> bool {
     simdutf8::basic::from_utf8(bytes).is_ok()
 }
 
@@ -190,7 +196,7 @@ impl ParsedBuffer for Utf8Field {
             if missing_is_null {
                 self.mutable.push_null()
             } else {
-                self.mutable.push(Some(""))
+                self.mutable.push(Some([]))
             }
             return Ok(());
         }
@@ -199,7 +205,7 @@ impl ParsedBuffer for Utf8Field {
         let escaped_bytes = if needs_escaping {
             self.scratch.clear();
             self.scratch.reserve(bytes.len());
-            polars_ensure!(bytes.len() > 1, ComputeError: "invalid csv file\n\nField `{}` is not properly escaped.", std::str::from_utf8(bytes).map_err(to_compute_err)?);
+            polars_ensure!(bytes.len() > 1 && bytes.last() == Some(&self.quote_char), ComputeError: "invalid csv file\n\nField `{}` is not properly escaped.", std::str::from_utf8(bytes).map_err(to_compute_err)?);
 
             // SAFETY:
             // we just allocated enough capacity and data_len is correct.
@@ -208,63 +214,59 @@ impl ParsedBuffer for Utf8Field {
                     escape_field(bytes, self.quote_char, self.scratch.spare_capacity_mut());
                 self.scratch.set_len(n_written);
             }
+
             self.scratch.as_slice()
         } else {
             bytes
         };
 
-        // It is important that this happens after escaping, as invalid escaped string can produce
-        // invalid utf8.
-        let parse_result = validate_utf8(escaped_bytes);
+        if matches!(self.encoding, CsvEncoding::LossyUtf8) | ignore_errors {
+            // It is important that this happens after escaping, as invalid escaped string can produce
+            // invalid utf8.
+            let parse_result = validate_utf8(escaped_bytes);
 
-        match parse_result {
-            true => {
-                let value = unsafe { std::str::from_utf8_unchecked(escaped_bytes) };
-                self.mutable.push_value(value)
-            },
-            false => {
-                if matches!(self.encoding, CsvEncoding::LossyUtf8) {
-                    // TODO! do this without allocating
-                    let s = String::from_utf8_lossy(escaped_bytes);
-                    self.mutable.push_value(s.as_ref())
-                } else if ignore_errors {
-                    self.mutable.push_null()
-                } else {
-                    // If field before escaping is valid utf8, the escaping is incorrect.
-                    if needs_escaping && validate_utf8(bytes) {
-                        polars_bail!(ComputeError: "string field is not properly escaped");
+            match parse_result {
+                true => {
+                    let value = escaped_bytes;
+                    self.mutable.push_value(value)
+                },
+                false => {
+                    if matches!(self.encoding, CsvEncoding::LossyUtf8) {
+                        // TODO! do this without allocating
+                        let s = String::from_utf8_lossy(escaped_bytes);
+                        self.mutable.push_value(s.as_ref().as_bytes())
+                    } else if ignore_errors {
+                        self.mutable.push_null()
                     } else {
-                        polars_bail!(ComputeError: "invalid utf-8 sequence");
+                        // If field before escaping is valid utf8, the escaping is incorrect.
+                        if needs_escaping && validate_utf8(bytes) {
+                            polars_bail!(ComputeError: "string field is not properly escaped");
+                        } else {
+                            polars_bail!(ComputeError: "invalid utf-8 sequence");
+                        }
                     }
-                }
-            },
+                },
+            }
+        } else {
+            self.mutable.push_value(escaped_bytes)
         }
 
         Ok(())
     }
 }
 
-#[cfg(not(feature = "dtype-categorical"))]
-pub struct CategoricalField {
-    phantom: std::marker::PhantomData<u8>,
-}
-
 #[cfg(feature = "dtype-categorical")]
-pub struct CategoricalField {
+pub struct CategoricalField<T: PolarsCategoricalType> {
     escape_scratch: Vec<u8>,
     quote_char: u8,
-    builder: CategoricalChunkedBuilder,
+    builder: CategoricalChunkedBuilder<T>,
 }
 
 #[cfg(feature = "dtype-categorical")]
-impl CategoricalField {
-    fn new(
-        name: PlSmallStr,
-        capacity: usize,
-        quote_char: Option<u8>,
-        ordering: CategoricalOrdering,
-    ) -> Self {
-        let builder = CategoricalChunkedBuilder::new(name, capacity, ordering);
+impl<T: PolarsCategoricalType> CategoricalField<T> {
+    fn new(name: PlSmallStr, capacity: usize, quote_char: Option<u8>, dtype: DataType) -> Self {
+        let mut builder = CategoricalChunkedBuilder::new(name, dtype);
+        builder.reserve(capacity);
 
         Self {
             escape_scratch: vec![],
@@ -286,7 +288,6 @@ impl CategoricalField {
             self.builder.append_null();
             return Ok(());
         }
-
         if validate_utf8(bytes) {
             if needs_escaping {
                 polars_ensure!(bytes.len() > 1, ComputeError: "invalid csv file\n\nField `{}` is not properly escaped.", std::str::from_utf8(bytes).map_err(to_compute_err)?);
@@ -306,14 +307,12 @@ impl CategoricalField {
                 // SAFETY:
                 // just did utf8 check
                 let key = unsafe { std::str::from_utf8_unchecked(&self.escape_scratch) };
-                self.builder.append_value(key);
+                self.builder.append_str(key)?;
             } else {
                 // SAFETY:
                 // just did utf8 check
-                unsafe {
-                    self.builder
-                        .append_value(std::str::from_utf8_unchecked(bytes))
-                }
+                let key = unsafe { std::str::from_utf8_unchecked(bytes) };
+                self.builder.append_str(key)?;
             }
         } else if ignore_errors {
             self.builder.append_null()
@@ -351,6 +350,72 @@ impl ParsedBuffer for BooleanChunkedBuilder {
                 String::from_utf8_lossy(bytes),
             );
         }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "dtype-decimal")]
+pub struct DecimalField {
+    builder: PrimitiveChunkedBuilder<Int128Type>,
+    precision: usize,
+    scale: usize,
+    decimal_comma: bool,
+}
+
+#[cfg(feature = "dtype-decimal")]
+impl DecimalField {
+    fn new(
+        name: PlSmallStr,
+        capacity: usize,
+        precision: usize,
+        scale: usize,
+        decimal_comma: bool,
+    ) -> Self {
+        let builder = PrimitiveChunkedBuilder::<Int128Type>::new(name, capacity);
+        Self {
+            builder,
+            precision,
+            scale,
+            decimal_comma,
+        }
+    }
+}
+
+#[cfg(feature = "dtype-decimal")]
+impl ParsedBuffer for DecimalField {
+    #[inline]
+    fn parse_bytes(
+        &mut self,
+        mut bytes: &[u8],
+        ignore_errors: bool,
+        needs_escaping: bool,
+        _missing_is_null: bool,
+        _time_unit: Option<TimeUnit>,
+    ) -> PolarsResult<()> {
+        if !bytes.is_empty() && needs_escaping {
+            bytes = &bytes[1..bytes.len() - 1];
+        }
+
+        if !bytes.is_empty() && could_be_whitespace_fast(bytes[0]) {
+            bytes = skip_whitespace(bytes);
+        }
+
+        if bytes.is_empty() {
+            self.builder.append_null();
+            return Ok(());
+        }
+
+        match str_to_dec128(bytes, self.precision, self.scale, self.decimal_comma) {
+            Some(value) => self.builder.append_value(value),
+            None => {
+                if ignore_errors {
+                    self.builder.append_null()
+                } else {
+                    polars_bail!(ComputeError: "invalid decimal value found during CSV parsing")
+                }
+            },
+        }
+
         Ok(())
     }
 }
@@ -506,12 +571,16 @@ pub fn init_buffers(
                 &DataType::Int16 => Buffer::Int16(PrimitiveChunkedBuilder::new(name, capacity)),
                 &DataType::Int32 => Buffer::Int32(PrimitiveChunkedBuilder::new(name, capacity)),
                 &DataType::Int64 => Buffer::Int64(PrimitiveChunkedBuilder::new(name, capacity)),
+                #[cfg(feature = "dtype-i128")]
+                &DataType::Int128 => Buffer::Int128(PrimitiveChunkedBuilder::new(name, capacity)),
                 #[cfg(feature = "dtype-u8")]
                 &DataType::UInt8 => Buffer::UInt8(PrimitiveChunkedBuilder::new(name, capacity)),
                 #[cfg(feature = "dtype-u16")]
                 &DataType::UInt16 => Buffer::UInt16(PrimitiveChunkedBuilder::new(name, capacity)),
                 &DataType::UInt32 => Buffer::UInt32(PrimitiveChunkedBuilder::new(name, capacity)),
                 &DataType::UInt64 => Buffer::UInt64(PrimitiveChunkedBuilder::new(name, capacity)),
+                #[cfg(feature = "dtype-u128")]
+                &DataType::UInt128 => Buffer::UInt128(PrimitiveChunkedBuilder::new(name, capacity)),
                 &DataType::Float32 => {
                     if decimal_comma {
                         Buffer::DecimalFloat32(
@@ -532,6 +601,14 @@ pub fn init_buffers(
                         Buffer::Float64(PrimitiveChunkedBuilder::new(name, capacity))
                     }
                 },
+                #[cfg(feature = "dtype-decimal")]
+                &DataType::Decimal(precision, scale) => Buffer::Decimal(DecimalField::new(
+                    name,
+                    capacity,
+                    precision,
+                    scale,
+                    decimal_comma,
+                )),
                 &DataType::String => {
                     Buffer::Utf8(Utf8Field::new(name, capacity, quote_char, encoding))
                 },
@@ -544,10 +621,34 @@ pub fn init_buffers(
                 #[cfg(feature = "dtype-date")]
                 &DataType::Date => Buffer::Date(DatetimeField::new(name, capacity)),
                 #[cfg(feature = "dtype-categorical")]
-                DataType::Categorical(_, ordering) => Buffer::Categorical(CategoricalField::new(
-                    name, capacity, quote_char, *ordering,
-                )),
-                // TODO (ENUM) support writing to Enum
+                DataType::Categorical(_, _) | DataType::Enum(_, _) => {
+                    match dtype.cat_physical().unwrap() {
+                        CategoricalPhysical::U8 => {
+                            Buffer::Categorical8(CategoricalField::<Categorical8Type>::new(
+                                name,
+                                capacity,
+                                quote_char,
+                                dtype.clone(),
+                            ))
+                        },
+                        CategoricalPhysical::U16 => {
+                            Buffer::Categorical16(CategoricalField::<Categorical16Type>::new(
+                                name,
+                                capacity,
+                                quote_char,
+                                dtype.clone(),
+                            ))
+                        },
+                        CategoricalPhysical::U32 => {
+                            Buffer::Categorical32(CategoricalField::<Categorical32Type>::new(
+                                name,
+                                capacity,
+                                quote_char,
+                                dtype.clone(),
+                            ))
+                        },
+                    }
+                },
                 dt => polars_bail!(
                     ComputeError: "unsupported data type when reading CSV: {} when reading CSV", dt,
                 ),
@@ -566,14 +667,20 @@ pub enum Buffer {
     Int16(PrimitiveChunkedBuilder<Int16Type>),
     Int32(PrimitiveChunkedBuilder<Int32Type>),
     Int64(PrimitiveChunkedBuilder<Int64Type>),
+    #[cfg(feature = "dtype-i128")]
+    Int128(PrimitiveChunkedBuilder<Int128Type>),
     #[cfg(feature = "dtype-u8")]
     UInt8(PrimitiveChunkedBuilder<UInt8Type>),
     #[cfg(feature = "dtype-u16")]
     UInt16(PrimitiveChunkedBuilder<UInt16Type>),
     UInt32(PrimitiveChunkedBuilder<UInt32Type>),
     UInt64(PrimitiveChunkedBuilder<UInt64Type>),
+    #[cfg(feature = "dtype-u128")]
+    UInt128(PrimitiveChunkedBuilder<UInt128Type>),
     Float32(PrimitiveChunkedBuilder<Float32Type>),
     Float64(PrimitiveChunkedBuilder<Float64Type>),
+    #[cfg(feature = "dtype-decimal")]
+    Decimal(DecimalField),
     /// Stores the Utf8 fields and the total string length seen for that column
     Utf8(Utf8Field),
     #[cfg(feature = "dtype-datetime")]
@@ -584,8 +691,12 @@ pub enum Buffer {
     },
     #[cfg(feature = "dtype-date")]
     Date(DatetimeField<Int32Type>),
-    #[allow(dead_code)]
-    Categorical(CategoricalField),
+    #[cfg(feature = "dtype-categorical")]
+    Categorical8(CategoricalField<Categorical8Type>),
+    #[cfg(feature = "dtype-categorical")]
+    Categorical16(CategoricalField<Categorical16Type>),
+    #[cfg(feature = "dtype-categorical")]
+    Categorical32(CategoricalField<Categorical32Type>),
     DecimalFloat32(PrimitiveChunkedBuilder<Float32Type>, Vec<u8>),
     DecimalFloat64(PrimitiveChunkedBuilder<Float64Type>, Vec<u8>),
 }
@@ -600,16 +711,33 @@ impl Buffer {
             Buffer::Int16(v) => v.finish().into_series(),
             Buffer::Int32(v) => v.finish().into_series(),
             Buffer::Int64(v) => v.finish().into_series(),
+            #[cfg(feature = "dtype-i128")]
+            Buffer::Int128(v) => v.finish().into_series(),
             #[cfg(feature = "dtype-u8")]
             Buffer::UInt8(v) => v.finish().into_series(),
             #[cfg(feature = "dtype-u16")]
             Buffer::UInt16(v) => v.finish().into_series(),
             Buffer::UInt32(v) => v.finish().into_series(),
             Buffer::UInt64(v) => v.finish().into_series(),
+            #[cfg(feature = "dtype-u128")]
+            Buffer::UInt128(v) => v.finish().into_series(),
             Buffer::Float32(v) => v.finish().into_series(),
             Buffer::Float64(v) => v.finish().into_series(),
             Buffer::DecimalFloat32(v, _) => v.finish().into_series(),
             Buffer::DecimalFloat64(v, _) => v.finish().into_series(),
+            #[cfg(feature = "dtype-decimal")]
+            Buffer::Decimal(DecimalField {
+                builder,
+                precision,
+                scale,
+                ..
+            }) => unsafe {
+                builder
+                    .finish()
+                    .into_series()
+                    .from_physical_unchecked(&DataType::Decimal(precision, scale))
+                    .unwrap()
+            },
             #[cfg(feature = "dtype-datetime")]
             Buffer::Datetime {
                 buf,
@@ -631,19 +759,15 @@ impl Buffer {
 
             Buffer::Utf8(v) => {
                 let arr = v.mutable.freeze();
-                StringChunked::with_chunk(v.name.clone(), arr).into_series()
+                StringChunked::with_chunk(v.name, unsafe { arr.to_utf8view_unchecked() })
+                    .into_series()
             },
-            #[allow(unused_variables)]
-            Buffer::Categorical(buf) => {
-                #[cfg(feature = "dtype-categorical")]
-                {
-                    buf.builder.finish().into_series()
-                }
-                #[cfg(not(feature = "dtype-categorical"))]
-                {
-                    panic!("activate 'dtype-categorical' feature")
-                }
-            },
+            #[cfg(feature = "dtype-categorical")]
+            Buffer::Categorical8(buf) => buf.builder.finish().into_series(),
+            #[cfg(feature = "dtype-categorical")]
+            Buffer::Categorical16(buf) => buf.builder.finish().into_series(),
+            #[cfg(feature = "dtype-categorical")]
+            Buffer::Categorical32(buf) => buf.builder.finish().into_series(),
         };
         Ok(s)
     }
@@ -657,14 +781,20 @@ impl Buffer {
             Buffer::Int16(v) => v.append_null(),
             Buffer::Int32(v) => v.append_null(),
             Buffer::Int64(v) => v.append_null(),
+            #[cfg(feature = "dtype-i128")]
+            Buffer::Int128(v) => v.append_null(),
             #[cfg(feature = "dtype-u8")]
             Buffer::UInt8(v) => v.append_null(),
             #[cfg(feature = "dtype-u16")]
             Buffer::UInt16(v) => v.append_null(),
             Buffer::UInt32(v) => v.append_null(),
             Buffer::UInt64(v) => v.append_null(),
+            #[cfg(feature = "dtype-u128")]
+            Buffer::UInt128(v) => v.append_null(),
             Buffer::Float32(v) => v.append_null(),
             Buffer::Float64(v) => v.append_null(),
+            #[cfg(feature = "dtype-decimal")]
+            Buffer::Decimal(buf) => buf.builder.append_null(),
             Buffer::DecimalFloat32(v, _) => v.append_null(),
             Buffer::DecimalFloat64(v, _) => v.append_null(),
             Buffer::Utf8(v) => {
@@ -678,17 +808,12 @@ impl Buffer {
             Buffer::Datetime { buf, .. } => buf.builder.append_null(),
             #[cfg(feature = "dtype-date")]
             Buffer::Date(v) => v.builder.append_null(),
-            #[allow(unused_variables)]
-            Buffer::Categorical(cat_builder) => {
-                #[cfg(feature = "dtype-categorical")]
-                {
-                    cat_builder.builder.append_null()
-                }
-                #[cfg(not(feature = "dtype-categorical"))]
-                {
-                    panic!("activate 'dtype-categorical' feature")
-                }
-            },
+            #[cfg(feature = "dtype-categorical")]
+            Buffer::Categorical8(buf) => buf.builder.append_null(),
+            #[cfg(feature = "dtype-categorical")]
+            Buffer::Categorical16(buf) => buf.builder.append_null(),
+            #[cfg(feature = "dtype-categorical")]
+            Buffer::Categorical32(buf) => buf.builder.append_null(),
         };
     }
 
@@ -701,30 +826,33 @@ impl Buffer {
             Buffer::Int16(_) => DataType::Int16,
             Buffer::Int32(_) => DataType::Int32,
             Buffer::Int64(_) => DataType::Int64,
+            #[cfg(feature = "dtype-i128")]
+            Buffer::Int128(_) => DataType::Int128,
             #[cfg(feature = "dtype-u8")]
             Buffer::UInt8(_) => DataType::UInt8,
             #[cfg(feature = "dtype-u16")]
             Buffer::UInt16(_) => DataType::UInt16,
             Buffer::UInt32(_) => DataType::UInt32,
             Buffer::UInt64(_) => DataType::UInt64,
+            #[cfg(feature = "dtype-u128")]
+            Buffer::UInt128(_) => DataType::UInt128,
             Buffer::Float32(_) | Buffer::DecimalFloat32(_, _) => DataType::Float32,
             Buffer::Float64(_) | Buffer::DecimalFloat64(_, _) => DataType::Float64,
+            #[cfg(feature = "dtype-decimal")]
+            Buffer::Decimal(DecimalField {
+                precision, scale, ..
+            }) => DataType::Decimal(*precision, *scale),
             Buffer::Utf8(_) => DataType::String,
             #[cfg(feature = "dtype-datetime")]
             Buffer::Datetime { time_unit, .. } => DataType::Datetime(*time_unit, None),
             #[cfg(feature = "dtype-date")]
             Buffer::Date(_) => DataType::Date,
-            Buffer::Categorical(_) => {
-                #[cfg(feature = "dtype-categorical")]
-                {
-                    DataType::Categorical(None, Default::default())
-                }
-
-                #[cfg(not(feature = "dtype-categorical"))]
-                {
-                    panic!("activate 'dtype-categorical' feature")
-                }
-            },
+            #[cfg(feature = "dtype-categorical")]
+            Buffer::Categorical8(buf) => buf.builder.dtype().clone(),
+            #[cfg(feature = "dtype-categorical")]
+            Buffer::Categorical16(buf) => buf.builder.dtype().clone(),
+            #[cfg(feature = "dtype-categorical")]
+            Buffer::Categorical32(buf) => buf.builder.dtype().clone(),
         }
     }
 
@@ -780,6 +908,15 @@ impl Buffer {
                 missing_is_null,
                 None,
             ),
+            #[cfg(feature = "dtype-i128")]
+            Int128(buf) => <PrimitiveChunkedBuilder<Int128Type> as ParsedBuffer>::parse_bytes(
+                buf,
+                bytes,
+                ignore_errors,
+                needs_escaping,
+                missing_is_null,
+                None,
+            ),
             #[cfg(feature = "dtype-u8")]
             UInt8(buf) => <PrimitiveChunkedBuilder<UInt8Type> as ParsedBuffer>::parse_bytes(
                 buf,
@@ -807,6 +944,15 @@ impl Buffer {
                 None,
             ),
             UInt64(buf) => <PrimitiveChunkedBuilder<UInt64Type> as ParsedBuffer>::parse_bytes(
+                buf,
+                bytes,
+                ignore_errors,
+                needs_escaping,
+                missing_is_null,
+                None,
+            ),
+            #[cfg(feature = "dtype-u128")]
+            UInt128(buf) => <PrimitiveChunkedBuilder<UInt128Type> as ParsedBuffer>::parse_bytes(
                 buf,
                 bytes,
                 ignore_errors,
@@ -852,6 +998,15 @@ impl Buffer {
                     None,
                 )
             },
+            #[cfg(feature = "dtype-decimal")]
+            Decimal(buf) => <DecimalField as ParsedBuffer>::parse_bytes(
+                buf,
+                bytes,
+                ignore_errors,
+                needs_escaping,
+                missing_is_null,
+                None,
+            ),
             Utf8(buf) => <Utf8Field as ParsedBuffer>::parse_bytes(
                 buf,
                 bytes,
@@ -880,17 +1035,17 @@ impl Buffer {
                 missing_is_null,
                 None,
             ),
-            #[allow(unused_variables)]
-            Categorical(buf) => {
-                #[cfg(feature = "dtype-categorical")]
-                {
-                    buf.parse_bytes(bytes, ignore_errors, needs_escaping, missing_is_null, None)
-                }
-
-                #[cfg(not(feature = "dtype-categorical"))]
-                {
-                    panic!("activate 'dtype-categorical' feature")
-                }
+            #[cfg(feature = "dtype-categorical")]
+            Categorical8(buf) => {
+                buf.parse_bytes(bytes, ignore_errors, needs_escaping, missing_is_null, None)
+            },
+            #[cfg(feature = "dtype-categorical")]
+            Categorical16(buf) => {
+                buf.parse_bytes(bytes, ignore_errors, needs_escaping, missing_is_null, None)
+            },
+            #[cfg(feature = "dtype-categorical")]
+            Categorical32(buf) => {
+                buf.parse_bytes(bytes, ignore_errors, needs_escaping, missing_is_null, None)
             },
         }
     }

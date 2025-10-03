@@ -37,11 +37,12 @@ import unittest
 import warnings
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import TYPE_CHECKING, Any, Iterator
+from typing import TYPE_CHECKING, Any
 
 import polars as pl
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from types import ModuleType
 
 
@@ -75,7 +76,6 @@ for mod, methods in OPTIONAL_MODULES_AND_METHODS.items():
 def doctest_teardown(d: doctest.DocTest) -> None:
     # don't let config changes or string cache state leak between tests
     pl.Config.restore_defaults()
-    pl.disable_string_cache()
 
 
 def modules_in_path(p: Path) -> Iterator[ModuleType]:
@@ -142,9 +142,10 @@ if __name__ == "__main__":
 
     doctest.OutputChecker = IgnoreResultOutputChecker  # type: ignore[misc]
 
-    # We want to be relaxed about whitespace, but strict on True vs 1
+    # Want to be relaxed about whitespace, strict on True vs 1, and allow '...' pattern
     doctest.NORMALIZE_WHITESPACE = True
     doctest.DONT_ACCEPT_TRUE_FOR_1 = True
+    doctest.ELLIPSIS = True
 
     # If REPORT_NDIFF is turned on, it will report on line by line, character by
     # character, differences. The disadvantage is that you cannot just copy the output

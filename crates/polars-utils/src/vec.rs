@@ -1,6 +1,10 @@
+#![allow(unsafe_op_in_unsafe_fn)]
 use std::mem::MaybeUninit;
 
+use bytemuck::Pod;
 use num_traits::Zero;
+
+use crate::with_drop::WithDrop;
 
 pub trait IntoRawParts<T> {
     fn into_raw_parts(self) -> (*mut T, usize, usize);
@@ -20,7 +24,7 @@ impl<T> IntoRawParts<T> for Vec<T> {
     }
 }
 
-/// Fill current allocation if if > 0
+/// Fill current allocation if > 0
 /// otherwise realloc
 pub trait ResizeFaster<T: Copy> {
     fn fill_or_alloc(&mut self, new_len: usize, value: T);
@@ -177,4 +181,14 @@ pub fn inplace_zip_filtermap<T, U>(
     // anymore.
     std::mem::forget(x_buf);
     std::mem::forget(y_buf);
+}
+
+pub fn with_cast_mut_vec<T: Pod, U: Pod, R, F: FnOnce(&mut Vec<U>) -> R>(
+    v: &mut Vec<T>,
+    f: F,
+) -> R {
+    let mut vu = WithDrop::new(bytemuck::cast_vec::<T, U>(core::mem::take(v)), |vu| {
+        *v = bytemuck::cast_vec::<U, T>(vu)
+    });
+    f(&mut vu)
 }

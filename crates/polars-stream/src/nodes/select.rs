@@ -24,10 +24,19 @@ impl SelectNode {
 
 impl ComputeNode for SelectNode {
     fn name(&self) -> &str {
-        "select"
+        if self.extend_original {
+            "with-columns"
+        } else {
+            "select"
+        }
     }
 
-    fn update_state(&mut self, recv: &mut [PortState], send: &mut [PortState]) -> PolarsResult<()> {
+    fn update_state(
+        &mut self,
+        recv: &mut [PortState],
+        send: &mut [PortState],
+        _state: &StreamingExecutionState,
+    ) -> PolarsResult<()> {
         assert!(recv.len() == 1 && send.len() == 1);
         recv.swap_with_slice(send);
         Ok(())
@@ -36,14 +45,14 @@ impl ComputeNode for SelectNode {
     fn spawn<'env, 's>(
         &'env mut self,
         scope: &'s TaskScope<'s, 'env>,
-        recv: &mut [Option<RecvPort<'_>>],
-        send: &mut [Option<SendPort<'_>>],
-        state: &'s ExecutionState,
+        recv_ports: &mut [Option<RecvPort<'_>>],
+        send_ports: &mut [Option<SendPort<'_>>],
+        state: &'s StreamingExecutionState,
         join_handles: &mut Vec<JoinHandle<PolarsResult<()>>>,
     ) {
-        assert!(recv.len() == 1 && send.len() == 1);
-        let receivers = recv[0].take().unwrap().parallel();
-        let senders = send[0].take().unwrap().parallel();
+        assert!(recv_ports.len() == 1 && send_ports.len() == 1);
+        let receivers = recv_ports[0].take().unwrap().parallel();
+        let senders = send_ports[0].take().unwrap().parallel();
 
         for (mut recv, mut send) in receivers.into_iter().zip(senders) {
             let slf = &*self;
@@ -52,7 +61,7 @@ impl ComputeNode for SelectNode {
                     let (df, seq, source_token, consume_token) = morsel.into_inner();
                     let mut selected = Vec::new();
                     for selector in slf.selectors.iter() {
-                        let s = selector.evaluate(&df, state).await?;
+                        let s = selector.evaluate(&df, &state.in_memory_exec_state).await?;
                         selected.push(s.into_column());
                     }
 

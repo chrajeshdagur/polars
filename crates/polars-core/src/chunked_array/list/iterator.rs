@@ -2,10 +2,9 @@ use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::rc::Rc;
 
-use polars_utils::unwrap::UnwrapUncheckedRelease;
-
+use crate::chunked_array::flags::StatisticsFlags;
 use crate::prelude::*;
-use crate::series::amortized_iter::{unstable_series_container_and_ptr, AmortSeries, ArrayBox};
+use crate::series::amortized_iter::{AmortSeries, ArrayBox, unstable_series_container_and_ptr};
 
 pub struct AmortizedListIter<'a, I: Iterator<Item = Option<ArrayBox>>> {
     len: usize,
@@ -18,7 +17,7 @@ pub struct AmortizedListIter<'a, I: Iterator<Item = Option<ArrayBox>>> {
     inner_dtype: DataType,
 }
 
-impl<'a, I: Iterator<Item = Option<ArrayBox>>> AmortizedListIter<'a, I> {
+impl<I: Iterator<Item = Option<ArrayBox>>> AmortizedListIter<'_, I> {
     pub(crate) unsafe fn new(
         len: usize,
         series_container: Series,
@@ -37,7 +36,7 @@ impl<'a, I: Iterator<Item = Option<ArrayBox>>> AmortizedListIter<'a, I> {
     }
 }
 
-impl<'a, I: Iterator<Item = Option<ArrayBox>>> Iterator for AmortizedListIter<'a, I> {
+impl<I: Iterator<Item = Option<ArrayBox>>> Iterator for AmortizedListIter<'_, I> {
     type Item = Option<AmortSeries>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -51,11 +50,11 @@ impl<'a, I: Iterator<Item = Option<ArrayBox>>> Iterator for AmortizedListIter<'a
                     // dtype is known
                     unsafe {
                         let s = Series::from_chunks_and_dtype_unchecked(
-                            PlSmallStr::EMPTY,
+                            self.series_container.name().clone(),
                             vec![array_ref],
                             &self.inner_dtype.to_physical(),
                         )
-                        .cast_unchecked(&self.inner_dtype)
+                        .from_physical_unchecked(&self.inner_dtype)
                         .unwrap();
                         let inner = Rc::make_mut(&mut self.series_container);
                         *inner = s;
@@ -78,16 +77,18 @@ impl<'a, I: Iterator<Item = Option<ArrayBox>>> Iterator for AmortizedListIter<'a
                     self.inner = NonNull::new(ptr).unwrap();
                 } else {
                     // SAFETY: we checked the RC above;
-                    let series_mut = unsafe {
-                        Rc::get_mut(&mut self.series_container).unwrap_unchecked_release()
-                    };
+                    let series_mut =
+                        unsafe { Rc::get_mut(&mut self.series_container).unwrap_unchecked() };
                     // update the inner state
                     unsafe { *self.inner.as_mut() = array_ref };
 
+                    // As an optimization, we try to minimize how many calls to
+                    // _get_inner_mut() we do.
+                    let series_mut_inner = series_mut._get_inner_mut();
                     // last iteration could have set the sorted flag (e.g. in compute_len)
-                    series_mut.clear_flags();
+                    series_mut_inner._set_flags(StatisticsFlags::empty());
                     // make sure that the length is correct
-                    series_mut._get_inner_mut().compute_len();
+                    series_mut_inner.compute_len();
                 }
 
                 // SAFETY:
@@ -106,7 +107,8 @@ impl<'a, I: Iterator<Item = Option<ArrayBox>>> Iterator for AmortizedListIter<'a
 
 // # Safety
 // we correctly implemented size_hint
-unsafe impl<'a, I: Iterator<Item = Option<ArrayBox>>> TrustedLen for AmortizedListIter<'a, I> {}
+unsafe impl<I: Iterator<Item = Option<ArrayBox>>> TrustedLen for AmortizedListIter<'_, I> {}
+impl<I: Iterator<Item = Option<ArrayBox>>> ExactSizeIterator for AmortizedListIter<'_, I> {}
 
 impl ListChunked {
     /// This is an iterator over a [`ListChunked`] that saves allocations.
@@ -122,7 +124,9 @@ impl ListChunked {
     ///
     /// If the returned `AmortSeries` is cloned, the local copy will be replaced and a new container
     /// will be set.
-    pub fn amortized_iter(&self) -> AmortizedListIter<impl Iterator<Item = Option<ArrayBox>> + '_> {
+    pub fn amortized_iter(
+        &self,
+    ) -> AmortizedListIter<'_, impl Iterator<Item = Option<ArrayBox>> + '_> {
         self.amortized_iter_with_name(PlSmallStr::EMPTY)
     }
 
@@ -130,7 +134,7 @@ impl ListChunked {
     pub fn amortized_iter_with_name(
         &self,
         name: PlSmallStr,
-    ) -> AmortizedListIter<impl Iterator<Item = Option<ArrayBox>> + '_> {
+    ) -> AmortizedListIter<'_, impl Iterator<Item = Option<ArrayBox>> + '_> {
         // we create the series container from the inner array
         // so that the container has the proper dtype.
         let arr = self.downcast_iter().next().unwrap();
@@ -151,7 +155,7 @@ impl ListChunked {
         let (s, ptr) =
             unsafe { unstable_series_container_and_ptr(name, inner_values.clone(), &iter_dtype) };
 
-        // SAFETY: ptr belongs the the Series..
+        // SAFETY: ptr belongs the Series..
         unsafe {
             AmortizedListIter::new(
                 self.len(),
@@ -280,6 +284,52 @@ impl ListChunked {
         out
     }
 
+    pub fn try_binary_zip_and_apply_amortized<'a, T, U, F>(
+        &'a self,
+        ca1: &'a ChunkedArray<T>,
+        ca2: &'a ChunkedArray<U>,
+        mut f: F,
+    ) -> PolarsResult<Self>
+    where
+        T: PolarsDataType,
+        U: PolarsDataType,
+        F: FnMut(
+            Option<AmortSeries>,
+            Option<T::Physical<'a>>,
+            Option<U::Physical<'a>>,
+        ) -> PolarsResult<Option<Series>>,
+    {
+        if self.is_empty() {
+            return Ok(self.clone());
+        }
+        let mut fast_explode = self.null_count() == 0;
+        let mut out: ListChunked = {
+            self.amortized_iter()
+                .zip(ca1.iter())
+                .zip(ca2.iter())
+                .map(|((opt_s, opt_u), opt_v)| {
+                    let out = f(opt_s, opt_u, opt_v)?;
+                    match out {
+                        Some(out) => {
+                            fast_explode &= !out.is_empty();
+                            Ok(Some(out))
+                        },
+                        None => {
+                            fast_explode = false;
+                            Ok(out)
+                        },
+                    }
+                })
+                .collect::<PolarsResult<_>>()?
+        };
+
+        out.rename(self.name().clone());
+        if fast_explode {
+            out.set_fast_explode();
+        }
+        Ok(out)
+    }
+
     pub fn try_zip_and_apply_amortized<'a, T, I, F>(
         &'a self,
         ca: &'a ChunkedArray<T>,
@@ -392,7 +442,7 @@ mod test {
 
     #[test]
     fn test_iter_list() {
-        let mut builder = get_list_builder(&DataType::Int32, 10, 10, PlSmallStr::EMPTY).unwrap();
+        let mut builder = get_list_builder(&DataType::Int32, 10, 10, PlSmallStr::EMPTY);
         builder
             .append_series(&Series::new(PlSmallStr::EMPTY, &[1, 2, 3]))
             .unwrap();

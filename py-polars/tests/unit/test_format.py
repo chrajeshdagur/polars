@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import string
 from decimal import Decimal as D
-from typing import TYPE_CHECKING, Any, Iterator
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -10,6 +10,8 @@ import polars as pl
 from polars.exceptions import InvalidOperationError
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from polars._typing import PolarsDataType
 
 
@@ -290,8 +292,9 @@ def test_fmt_float_full() -> None:
 
 def test_fmt_list_12188() -> None:
     # set max_items to 1 < 4(size of failed list) to touch the testing branch.
-    with pl.Config(fmt_table_cell_list_len=1), pytest.raises(
-        InvalidOperationError, match="from `i64` to `u8` failed"
+    with (
+        pl.Config(fmt_table_cell_list_len=1),
+        pytest.raises(InvalidOperationError, match="from `i64` to `u8` failed"),
     ):
         pl.DataFrame(
             {
@@ -360,14 +363,13 @@ def test_format_numeric_locale_options() -> None:
         thousands_separator=",",
         float_precision=3,
     ):
-        print(df)
         assert (
             str(df)
             == """shape: (2, 4)
 ┌─────┬──────────────┬────────────────┬─────────────────┐
 │ a   ┆            b ┆              c ┆               d │
 │ --- ┆          --- ┆            --- ┆             --- │
-│ str ┆          f64 ┆            i64 ┆    decimal[*,4] │
+│ str ┆          f64 ┆            i64 ┆   decimal[38,4] │
 ╞═════╪══════════════╪════════════════╪═════════════════╡
 │ xx  ┆  100,000.988 ┆    -11,111,111 ┆     12,345.6789 │
 │ yy  ┆ -234,567.890 ┆ 44,444,444,444 ┆ -9,999,999.9900 │
@@ -385,7 +387,7 @@ def test_format_numeric_locale_options() -> None:
 ┌─────┬────────────────┬────────────────┬─────────────────┐
 │ a   ┆ b              ┆ c              ┆ d               │
 │ --- ┆ ---            ┆ ---            ┆ ---             │
-│ str ┆ f64            ┆ i64            ┆ decimal[*,4]    │
+│ str ┆ f64            ┆ i64            ┆ decimal[38,4]   │
 ╞═════╪════════════════╪════════════════╪═════════════════╡
 │ xx  ┆ 100.000,987654 ┆ -11.111.111    ┆ 12.345,6789     │
 │ yy  ┆ -234.567,89    ┆ 44.444.444.444 ┆ -9.999.999,9900 │
@@ -399,7 +401,7 @@ def test_format_numeric_locale_options() -> None:
 ┌─────┬───────────────┬─────────────┬───────────────┐
 │ a   ┆ b             ┆ c           ┆ d             │
 │ --- ┆ ---           ┆ ---         ┆ ---           │
-│ str ┆ f64           ┆ i64         ┆ decimal[*,4]  │
+│ str ┆ f64           ┆ i64         ┆ decimal[38,4] │
 ╞═════╪═══════════════╪═════════════╪═══════════════╡
 │ xx  ┆ 100000.987654 ┆ -11111111   ┆ 12345.6789    │
 │ yy  ┆ -234567.89    ┆ 44444444444 ┆ -9999999.9900 │
@@ -470,3 +472,41 @@ Series: '' [decimal[38,38]]
 def test_simple_project_format(lf: pl.LazyFrame, expected: str) -> None:
     result = lf.explain()
     assert expected in result
+
+
+@pytest.mark.parametrize(
+    ("df", "expected"),
+    [
+        pytest.param(
+            pl.DataFrame({"A": range(4)}),
+            """shape: (4, 1)
++-----+
+| A   |
++=====+
+| 0   |
+| 1   |
+| ... |
+| 3   |
++-----+""",
+            id="Ellipsis correctly aligned",
+        ),
+        pytest.param(
+            pl.DataFrame({"A": range(2)}),
+            """shape: (2, 1)
++---+
+| A |
++===+
+| 0 |
+| 1 |
++---+""",
+            id="No ellipsis needed",
+        ),
+    ],
+)
+def test_format_ascii_table_truncation(df: pl.DataFrame, expected: str) -> None:
+    with pl.Config(tbl_rows=3, tbl_hide_column_data_types=True, ascii_tables=True):
+        assert str(df) == expected
+
+
+def test_format_21393() -> None:
+    assert pl.select(pl.format("{}", pl.lit(1, pl.Int128))).item() == "1"

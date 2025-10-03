@@ -1,31 +1,40 @@
+mod builder;
+mod equality;
+mod evaluate;
+mod function_expr;
 #[cfg(feature = "cse")]
 mod hash;
+mod minterm_iter;
+pub mod predicates;
 mod scalar;
 mod schema;
 mod traverse;
-mod utils;
 
 use std::hash::{Hash, Hasher};
 
+pub use function_expr::*;
 #[cfg(feature = "cse")]
 pub(super) use hash::traverse_and_hash_aexpr;
+pub use minterm_iter::MintermIter;
+use polars_compute::rolling::QuantileMethod;
 use polars_core::chunked_array::cast::CastOptions;
 use polars_core::prelude::*;
 use polars_core::utils::{get_time_units, try_get_supertype};
 use polars_utils::arena::{Arena, Node};
 pub use scalar::is_scalar_ae;
-#[cfg(feature = "ir_serde")]
-use serde::{Deserialize, Serialize};
 use strum_macros::IntoStaticStr;
 pub use traverse::*;
-pub use utils::*;
+mod properties;
+pub use aexpr::function_expr::schema::FieldsMapper;
+pub use builder::AExprBuilder;
+pub use properties::*;
+pub use schema::ToFieldContext;
 
 use crate::constants::LEN;
-use crate::plans::Context;
 use crate::prelude::*;
 
 #[derive(Clone, Debug, IntoStaticStr)]
-#[cfg_attr(feature = "ir_serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "ir_serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum IRAggExpr {
     Min {
         input: Node,
@@ -44,10 +53,13 @@ pub enum IRAggExpr {
     Quantile {
         expr: Node,
         quantile: Node,
-        interpol: QuantileInterpolOptions,
+        method: QuantileMethod,
     },
     Sum(Node),
-    Count(Node, bool),
+    Count {
+        input: Node,
+        include_nulls: bool,
+    },
     Std(Node, u8),
     Var(Node, u8),
     AggGroups(Node),
@@ -57,17 +69,27 @@ impl Hash for IRAggExpr {
     fn hash<H: Hasher>(&self, state: &mut H) {
         std::mem::discriminant(self).hash(state);
         match self {
-            Self::Min { propagate_nans, .. } | Self::Max { propagate_nans, .. } => {
-                propagate_nans.hash(state)
-            },
-            Self::Quantile { interpol, .. } => interpol.hash(state),
+            Self::Min {
+                input: _,
+                propagate_nans,
+            }
+            | Self::Max {
+                input: _,
+                propagate_nans,
+            } => propagate_nans.hash(state),
+            Self::Quantile {
+                method: interpol, ..
+            } => interpol.hash(state),
             Self::Std(_, v) | Self::Var(_, v) => v.hash(state),
+            Self::Count {
+                input: _,
+                include_nulls,
+            } => include_nulls.hash(state),
             _ => {},
         }
     }
 }
 
-#[cfg(feature = "cse")]
 impl IRAggExpr {
     pub(super) fn equal_nodes(&self, other: &IRAggExpr) -> bool {
         use IRAggExpr::*;
@@ -88,7 +110,7 @@ impl IRAggExpr {
                     propagate_nans: r, ..
                 },
             ) => l == r,
-            (Quantile { interpol: l, .. }, Quantile { interpol: r, .. }) => l == r,
+            (Quantile { method: l, .. }, Quantile { method: r, .. }) => l == r,
             (Std(_, l), Std(_, r)) => l == r,
             (Var(_, l), Var(_, r)) => l == r,
             _ => std::mem::discriminant(self) == std::mem::discriminant(other),
@@ -100,14 +122,20 @@ impl From<IRAggExpr> for GroupByMethod {
     fn from(value: IRAggExpr) -> Self {
         use IRAggExpr::*;
         match value {
-            Min { propagate_nans, .. } => {
+            Min {
+                input: _,
+                propagate_nans,
+            } => {
                 if propagate_nans {
                     GroupByMethod::NanMin
                 } else {
                     GroupByMethod::Min
                 }
             },
-            Max { propagate_nans, .. } => {
+            Max {
+                input: _,
+                propagate_nans,
+            } => {
                 if propagate_nans {
                     GroupByMethod::NanMax
                 } else {
@@ -121,7 +149,10 @@ impl From<IRAggExpr> for GroupByMethod {
             Mean(_) => GroupByMethod::Mean,
             Implode(_) => GroupByMethod::Implode,
             Sum(_) => GroupByMethod::Sum,
-            Count(_, include_nulls) => GroupByMethod::Count { include_nulls },
+            Count {
+                input: _,
+                include_nulls,
+            } => GroupByMethod::Count { include_nulls },
             Std(_, ddof) => GroupByMethod::Std(ddof),
             Var(_, ddof) => GroupByMethod::Var(ddof),
             AggGroups(_) => GroupByMethod::Groups,
@@ -132,10 +163,12 @@ impl From<IRAggExpr> for GroupByMethod {
 
 /// IR expression node that is allocated in an [`Arena`][polars_utils::arena::Arena].
 #[derive(Clone, Debug, Default)]
-#[cfg_attr(feature = "ir_serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "ir_serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum AExpr {
-    Explode(Node),
-    Alias(Node, PlSmallStr),
+    Explode {
+        expr: Node,
+        skip_empty: bool,
+    },
     Column(PlSmallStr),
     Literal(LiteralValue),
     BinaryExpr {
@@ -174,18 +207,30 @@ pub enum AExpr {
     },
     AnonymousFunction {
         input: Vec<ExprIR>,
-        function: SpecialEq<Arc<dyn ColumnsUdf>>,
-        output_type: GetOutput,
+        function: OpaqueColumnUdf,
         options: FunctionOptions,
+        fmt_str: Box<PlSmallStr>,
+    },
+    /// Evaluates the `evaluation` expression on the output of the `expr`.
+    ///
+    /// Consequently, `expr` is an input and `evaluation` is not and needs a different schema.
+    Eval {
+        expr: Node,
+
+        /// An expression that is guaranteed to not contain any column reference beyond
+        /// `pl.element()` which refers to `pl.col("")`.
+        evaluation: Node,
+
+        variant: EvalVariant,
     },
     Function {
         /// Function arguments
         /// Some functions rely on aliases,
         /// for instance assignment of struct fields.
-        /// Therefor we need `[ExprIr]`.
+        /// Therefor we need [`ExprIr`].
         input: Vec<ExprIR>,
         /// function to apply
-        function: FunctionExpr,
+        function: IRFunctionExpr,
         options: FunctionOptions,
     },
     Window {
@@ -208,50 +253,49 @@ impl AExpr {
     pub(crate) fn col(name: PlSmallStr) -> Self {
         AExpr::Column(name)
     }
-    /// Any expression that is sensitive to the number of elements in a group
-    /// - Aggregations
-    /// - Sorts
-    /// - Counts
-    /// - ..
-    pub(crate) fn groups_sensitive(&self) -> bool {
-        use AExpr::*;
+
+    #[recursive::recursive]
+    pub fn is_scalar(&self, arena: &Arena<AExpr>) -> bool {
         match self {
-            Function { options, .. } | AnonymousFunction { options, .. } => {
-                options.is_groups_sensitive()
-            }
-            Sort { .. }
-            | SortBy { .. }
-            | Agg { .. }
-            | Window { .. }
-            | Len
-            | Slice { .. }
-            | Gather { .. }
-             => true,
-            Alias(_, _)
-            | Explode(_)
-            | Column(_)
-            | Literal(_)
-            // a caller should traverse binary and ternary
-            // to determine if the whole expr. is group sensitive
-            | BinaryExpr { .. }
-            | Ternary { .. }
-            | Cast { .. }
-            | Filter { .. } => false,
+            AExpr::Literal(lv) => lv.is_scalar(),
+            AExpr::Function { options, input, .. }
+            | AExpr::AnonymousFunction { options, input, .. } => {
+                if options.flags.contains(FunctionFlags::RETURNS_SCALAR) {
+                    true
+                } else if options.is_elementwise()
+                    || options.flags.contains(FunctionFlags::LENGTH_PRESERVING)
+                {
+                    input.iter().all(|e| e.is_scalar(arena))
+                } else {
+                    false
+                }
+            },
+            AExpr::BinaryExpr { left, right, .. } => {
+                is_scalar_ae(*left, arena) && is_scalar_ae(*right, arena)
+            },
+            AExpr::Ternary {
+                predicate,
+                truthy,
+                falsy,
+            } => {
+                is_scalar_ae(*predicate, arena)
+                    && is_scalar_ae(*truthy, arena)
+                    && is_scalar_ae(*falsy, arena)
+            },
+            AExpr::Agg(_) | AExpr::Len => true,
+            AExpr::Cast { expr, .. } => is_scalar_ae(*expr, arena),
+            AExpr::Eval { expr, variant, .. } => match variant {
+                EvalVariant::List => is_scalar_ae(*expr, arena),
+                EvalVariant::Cumulative { .. } => is_scalar_ae(*expr, arena),
+            },
+            AExpr::Sort { expr, .. } => is_scalar_ae(*expr, arena),
+            AExpr::Gather { returns_scalar, .. } => *returns_scalar,
+            AExpr::SortBy { expr, .. } => is_scalar_ae(*expr, arena),
+            AExpr::Window { function, .. } => is_scalar_ae(*function, arena),
+            AExpr::Explode { .. }
+            | AExpr::Column(_)
+            | AExpr::Filter { .. }
+            | AExpr::Slice { .. } => false,
         }
-    }
-
-    /// This should be a 1 on 1 copy of the get_type method of Expr until Expr is completely phased out.
-    pub fn get_type(
-        &self,
-        schema: &Schema,
-        ctxt: Context,
-        arena: &Arena<AExpr>,
-    ) -> PolarsResult<DataType> {
-        self.to_field(schema, ctxt, arena)
-            .map(|f| f.dtype().clone())
-    }
-
-    pub(crate) fn is_leaf(&self) -> bool {
-        matches!(self, AExpr::Column(_) | AExpr::Literal(_) | AExpr::Len)
     }
 }

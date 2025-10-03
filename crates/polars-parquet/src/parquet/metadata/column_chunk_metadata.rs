@@ -1,4 +1,4 @@
-use parquet_format_safe::{ColumnChunk, ColumnMetaData, Encoding};
+use polars_parquet_format::{ColumnChunk, ColumnMetaData, Encoding};
 
 use super::column_descriptor::ColumnDescriptor;
 use crate::parquet::compression::Compression;
@@ -6,18 +6,18 @@ use crate::parquet::error::{ParquetError, ParquetResult};
 use crate::parquet::schema::types::PhysicalType;
 use crate::parquet::statistics::Statistics;
 
-#[cfg(feature = "serde_types")]
+#[cfg(feature = "serde")]
 mod serde_types {
     pub use std::io::Cursor;
 
-    pub use parquet_format_safe::thrift::protocol::{
+    pub use polars_parquet_format::thrift::protocol::{
         TCompactInputProtocol, TCompactOutputProtocol,
     };
     pub use serde::de::Error as DeserializeError;
     pub use serde::ser::Error as SerializeError;
     pub use serde::{Deserialize, Deserializer, Serialize, Serializer};
 }
-#[cfg(feature = "serde_types")]
+#[cfg(feature = "serde")]
 use serde_types::*;
 
 /// Metadata for a column chunk.
@@ -27,21 +27,18 @@ use serde_types::*;
 ///
 /// This struct is intentionally not `Clone`, as it is a huge struct.
 #[derive(Debug)]
-#[cfg_attr(feature = "serde_types", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 pub struct ColumnChunkMetadata {
+    #[cfg_attr(feature = "serde", serde(serialize_with = "serialize_column_chunk"))]
     #[cfg_attr(
-        feature = "serde_types",
-        serde(serialize_with = "serialize_column_chunk")
-    )]
-    #[cfg_attr(
-        feature = "serde_types",
+        feature = "serde",
         serde(deserialize_with = "deserialize_column_chunk")
     )]
     column_chunk: ColumnChunk,
     column_descr: ColumnDescriptor,
 }
 
-#[cfg(feature = "serde_types")]
+#[cfg(feature = "serde")]
 fn serialize_column_chunk<S>(
     column_chunk: &ColumnChunk,
     serializer: S,
@@ -58,15 +55,18 @@ where
     serializer.serialize_bytes(&buf)
 }
 
-#[cfg(feature = "serde_types")]
+#[cfg(feature = "serde")]
 fn deserialize_column_chunk<'de, D>(deserializer: D) -> std::result::Result<ColumnChunk, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let buf = Vec::<u8>::deserialize(deserializer)?;
-    let mut cursor = Cursor::new(&buf[..]);
-    let mut protocol = TCompactInputProtocol::new(&mut cursor, usize::MAX);
-    ColumnChunk::read_from_in_protocol(&mut protocol).map_err(D::Error::custom)
+    use polars_utils::pl_serialize::deserialize_map_bytes;
+
+    deserialize_map_bytes(deserializer, |b| {
+        let mut b = b.as_ref();
+        let mut protocol = TCompactInputProtocol::new(&mut b, usize::MAX);
+        ColumnChunk::read_from_in_protocol(&mut protocol).map_err(D::Error::custom)
+    })?
 }
 
 // Represents common operations for a column chunk.

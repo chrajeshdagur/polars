@@ -42,7 +42,7 @@ fn write_csv() {
 #[test]
 #[cfg(feature = "timezones")]
 fn write_dates() {
-    use polars_core::export::chrono;
+    use chrono;
 
     let s0 = Column::new(
         "date".into(),
@@ -117,7 +117,9 @@ fn write_dates() {
 
     let with_timezone = polars_ops::chunked_array::replace_time_zone(
         s2.slice(0, 1).datetime().unwrap(),
-        Some("America/New_York"),
+        TimeZone::opt_try_new(Some("America/New_York"))
+            .unwrap()
+            .as_ref(),
         &StringChunked::new("".into(), ["raise"]),
         NonExistent::Raise,
     )
@@ -221,14 +223,6 @@ fn test_parser() -> PolarsResult<()> {
     assert_eq!(col.get(2)?, AnyValue::String("Setosa"));
 
     assert_eq!("sepal_length", df.get_columns()[0].name().as_str());
-    assert_eq!(
-        1,
-        df.column("sepal_length")
-            .unwrap()
-            .as_materialized_series()
-            .chunks()
-            .len()
-    );
     assert_eq!(df.height(), 7);
 
     // test windows line endings
@@ -313,18 +307,21 @@ fn test_missing_data() {
 
     let file = Cursor::new(csv);
     let df = CsvReader::new(file).finish().unwrap();
-    assert!(df
-        .column("column_1")
-        .unwrap()
-        .equals(&Column::new("column_1".into(), &[1_i64, 1])));
-    assert!(df
-        .column("column_2")
-        .unwrap()
-        .equals_missing(&Column::new("column_2".into(), &[Some(2_i64), None])));
-    assert!(df
-        .column("column_3")
-        .unwrap()
-        .equals(&Column::new("column_3".into(), &[3_i64, 3])));
+    assert!(
+        df.column("column_1")
+            .unwrap()
+            .equals(&Column::new("column_1".into(), &[1_i64, 1]))
+    );
+    assert!(
+        df.column("column_2")
+            .unwrap()
+            .equals_missing(&Column::new("column_2".into(), &[Some(2_i64), None]))
+    );
+    assert!(
+        df.column("column_3")
+            .unwrap()
+            .equals(&Column::new("column_3".into(), &[3_i64, 3]))
+    );
 }
 
 #[test]
@@ -336,10 +333,11 @@ fn test_escape_comma() {
     let file = Cursor::new(csv);
     let df = CsvReader::new(file).finish().unwrap();
     assert_eq!(df.shape(), (2, 3));
-    assert!(df
-        .column("column_3")
-        .unwrap()
-        .equals(&Column::new("column_3".into(), &[11_i64, 12])));
+    assert!(
+        df.column("column_3")
+            .unwrap()
+            .equals(&Column::new("column_3".into(), &[11_i64, 12]))
+    );
 }
 
 #[test]
@@ -407,10 +405,11 @@ hello,","," ",world,"!"
         ("column_4", "world"),
         ("column_5", "!"),
     ] {
-        assert!(df
-            .column(col)
-            .unwrap()
-            .equals(&Column::new(col.into(), &[val; 4])));
+        assert!(
+            df.column(col)
+                .unwrap()
+                .equals(&Column::new(col.into(), &[val; 4]))
+        );
     }
 }
 
@@ -1331,7 +1330,7 @@ fn test_empty_csv() {
 }
 
 #[test]
-fn test_try_parse_dates() -> PolarsResult<()> {
+fn test_try_parse_dates_empty() -> PolarsResult<()> {
     let csv = "date
 1745-04-02
 1742-03-21
@@ -1397,9 +1396,12 @@ fn test_read_io_reader() {
 
     let mut reader = reader.batched_borrowed().unwrap();
     let batches = reader.next_batches(5).unwrap().unwrap();
-    // TODO: Fix this
-    // assert_eq!(batches.len(), 5);
+    assert_eq!(batches.len(), 5);
     let df = concat_df(&batches).unwrap();
-    let expected = CsvReader::new(file).finish().unwrap();
-    assert!(df.equals(&expected))
+    assert!(df.height() > 0);
+    let expected = CsvReader::new(file)
+        .finish()
+        .unwrap()
+        .head(Some(df.height()));
+    assert_eq!(&df, &expected);
 }

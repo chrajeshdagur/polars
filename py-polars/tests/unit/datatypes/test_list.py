@@ -10,7 +10,7 @@ import pytest
 
 import polars as pl
 from polars.testing import assert_frame_equal, assert_series_equal
-from tests.unit.conftest import NUMERIC_DTYPES
+from tests.unit.conftest import NUMERIC_DTYPES, TEMPORAL_DTYPES
 
 if TYPE_CHECKING:
     from polars._typing import PolarsDataType
@@ -49,7 +49,7 @@ def test_dtype() -> None:
         "u": pl.List(pl.UInt64),
         "tm": pl.List(pl.Time),
         "dt": pl.List(pl.Date),
-        "dtm": pl.List(pl.Datetime),
+        "dtm": pl.List(pl.Datetime("us")),
     }
     assert all(tp.is_nested() for tp in df.dtypes)
     assert df.schema["i"].inner == pl.Int8  # type: ignore[attr-defined]
@@ -143,6 +143,15 @@ def test_list_fill_null() -> None:
     ).to_series().to_list() == [["a", "b", "c"], None, None, ["d", "e"]]
 
 
+def test_list_fill_select_null() -> None:
+    assert pl.DataFrame({"a": [None, []]}).select(
+        pl.when(pl.col("a").list.len() == 0)
+        .then(None)
+        .otherwise(pl.col("a"))
+        .alias("a")
+    ).to_series().to_list() == [None, None]
+
+
 def test_list_fill_list() -> None:
     assert pl.DataFrame({"a": [[1, 2, 3], []]}).select(
         pl.when(pl.col("a").list.len() == 0)
@@ -160,7 +169,7 @@ def test_empty_list_construction() -> None:
     assert df.to_dict(as_series=False) == expected
 
     df = pl.DataFrame(schema=[("col", pl.List)])
-    assert df.schema == {"col": pl.List}
+    assert df.schema == {"col": pl.List(pl.Null)}
     assert df.rows() == []
 
 
@@ -191,19 +200,13 @@ def test_inner_type_categorical_on_rechunk() -> None:
     assert pl.concat([df, df], rechunk=True).dtypes == [pl.List(pl.Categorical)]
 
 
-def test_local_categorical_list() -> None:
+def test_categorical_list() -> None:
     values = [["a", "b"], ["c"], ["a", "d", "d"]]
     s = pl.Series(values, dtype=pl.List(pl.Categorical))
     assert s.dtype == pl.List
     assert s.dtype.inner == pl.Categorical  # type: ignore[attr-defined]
     assert s.to_list() == values
-
-    # Check that underlying physicals match
-    idx_df = pl.Series([[0, 1], [2], [0, 3, 3]], dtype=pl.List(pl.UInt32))
-    assert_series_equal(s.cast(pl.List(pl.UInt32)), idx_df)
-
-    # Check if the categories array does not overlap
-    assert s.list.explode().cat.get_categories().to_list() == ["a", "b", "c", "d"]
+    assert s.explode().to_list() == ["a", "b", "c", "a", "d", "d"]
 
 
 def test_group_by_list_column() -> None:
@@ -291,9 +294,17 @@ def test_fast_explode_on_list_struct_6208() -> None:
 def test_flat_aggregation_to_list_conversion_6918() -> None:
     df = pl.DataFrame({"a": [1, 2, 2], "b": [[0, 1], [2, 3], [4, 5]]})
 
-    assert df.group_by("a", maintain_order=True).agg(
-        pl.concat_list([pl.col("b").list.get(i).mean().implode() for i in range(2)])
-    ).to_dict(as_series=False) == {"a": [1, 2], "b": [[[0.0, 1.0]], [[3.0, 4.0]]]}
+    q = (
+        df.lazy()
+        .group_by("a", maintain_order=True)
+        .agg(
+            pl.concat_list([pl.col("b").list.get(i).mean().implode() for i in range(2)])
+        )
+    )
+
+    out = q.collect()
+    assert out.to_dict(as_series=False) == {"a": [1, 2], "b": [[0.0, 1.0], [3.0, 4.0]]}
+    assert q.collect_schema() == out.schema
 
 
 def test_list_count_matches() -> None:
@@ -467,8 +478,8 @@ def test_fill_null_empty_list() -> None:
 
 def test_nested_logical() -> None:
     assert pl.select(
-        pl.lit(pl.Series(["a", "b"], dtype=pl.Categorical)).implode().implode()
-    ).to_dict(as_series=False) == {"": [[["a", "b"]]]}
+        pl.lit(pl.Series("col", ["a", "b"], dtype=pl.Categorical)).implode().implode()
+    ).to_dict(as_series=False) == {"col": [[["a", "b"]]]}
 
 
 def test_null_list_construction_and_materialization() -> None:
@@ -679,30 +690,6 @@ def data_dispersion() -> pl.DataFrame:
     )
 
 
-def test_list_var(data_dispersion: pl.DataFrame) -> None:
-    df = data_dispersion
-
-    result = df.select(
-        pl.col("int").list.var().name.suffix("_var"),
-        pl.col("float").list.var().name.suffix("_var"),
-        pl.col("duration").list.var().name.suffix("_var"),
-    )
-
-    expected = pl.DataFrame(
-        [
-            pl.Series("int_var", [2.5], dtype=pl.Float64),
-            pl.Series("float_var", [2.5], dtype=pl.Float64),
-            pl.Series(
-                "duration_var",
-                [timedelta(microseconds=2000)],
-                dtype=pl.Duration(time_unit="ms"),
-            ),
-        ]
-    )
-
-    assert_frame_equal(result, expected)
-
-
 def test_list_std(data_dispersion: pl.DataFrame) -> None:
     df = data_dispersion
 
@@ -839,3 +826,54 @@ def test_null_list_categorical_16405() -> None:
 
     expected = pl.DataFrame([None], schema={"result": pl.List(pl.Categorical)})
     assert_frame_equal(df, expected)
+
+
+def test_list_get_literal_broadcast_21463() -> None:
+    df = pl.DataFrame({"a": [1, 2, 3]})
+    df = df.with_columns(x=pl.lit([1, 2, 3, 4]))
+    expected = df.with_columns(b=pl.col("x").list.get(pl.col("a"))).drop("x")
+    df = pl.DataFrame({"a": [1, 2, 3]})
+    actual = df.with_columns(b=pl.lit([1, 2, 3, 4]).list.get(pl.col("a")))
+    assert expected.equals(actual)
+
+
+def test_sort() -> None:
+    def tc(a: list[Any], b: list[Any]) -> None:
+        a_s = pl.Series("l", a, pl.List(pl.Int64))
+        b_s = pl.Series("l", b, pl.List(pl.Int64))
+
+        assert_series_equal(a_s.sort(), b_s)
+
+    tc([], [])
+    tc([[1]], [[1]])
+    tc([[1], []], [[], [1]])
+    tc([[2, 1]], [[2, 1]])
+    tc([[2, 1], [1, 2]], [[1, 2], [2, 1]])
+
+
+@pytest.mark.parametrize("inner_dtype", TEMPORAL_DTYPES)
+@pytest.mark.parametrize("agg", ["min", "max", "mean", "median"])
+def test_list_agg_temporal(inner_dtype: PolarsDataType, agg: str) -> None:
+    lf = pl.LazyFrame({"a": [[1, 3]]}, schema={"a": pl.List(inner_dtype)})
+    result = lf.select(getattr(pl.col("a").list, agg)())
+    expected = lf.select(getattr(pl.col("a").explode(), agg)())
+    assert result.collect_schema() == expected.collect_schema()
+    assert_frame_equal(result.collect(), expected.collect())
+
+
+@pytest.mark.parametrize("maintain_order", [False, True])
+def test_list_implode_concat_agg_schema_23974(maintain_order: bool) -> None:
+    df = pl.DataFrame({"g": [10, 10, 20], "a": [1, 2, 3]})
+    q = (
+        df.lazy()
+        .group_by("g", maintain_order=maintain_order)
+        .agg(
+            pl.concat_list(
+                [pl.col("a").first().implode(), pl.col("a").last().implode()]
+            )
+        )
+    )
+    expected = pl.DataFrame({"g": [10, 20], "a": [[1, 2], [3, 3]]})
+    out = q.collect()
+    assert_frame_equal(out, expected, check_row_order=maintain_order)
+    assert q.collect_schema() == out.schema

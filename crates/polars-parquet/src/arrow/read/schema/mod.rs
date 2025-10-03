@@ -6,7 +6,7 @@ mod metadata;
 
 pub(crate) use convert::*;
 pub use convert::{parquet_to_arrow_schema, parquet_to_arrow_schema_with_options};
-pub use metadata::read_schema_from_metadata;
+pub use metadata::{read_custom_key_value_metadata, read_schema_from_metadata};
 use polars_error::PolarsResult;
 
 use self::metadata::parse_key_value_metadata;
@@ -40,7 +40,7 @@ impl Default for SchemaInferenceOptions {
 ///
 /// # Error
 /// This function errors iff the key `"ARROW:schema"` exists but is not correctly encoded,
-/// indicating that that the file's arrow metadata was incorrectly written.
+/// indicating that the file's arrow metadata was incorrectly written.
 pub fn infer_schema(file_metadata: &FileMetadata) -> PolarsResult<ArrowSchema> {
     infer_schema_with_options(file_metadata, &None)
 }

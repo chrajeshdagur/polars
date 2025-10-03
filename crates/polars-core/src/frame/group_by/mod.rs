@@ -2,26 +2,26 @@ use std::fmt::{Debug, Display, Formatter};
 use std::hash::Hash;
 
 use num_traits::NumCast;
+use polars_compute::rolling::QuantileMethod;
 use polars_utils::format_pl_smallstr;
 use polars_utils::hashing::DirtyHash;
 use rayon::prelude::*;
 
 use self::hashing::*;
+use crate::POOL;
 use crate::prelude::*;
 use crate::utils::{_set_partition_size, accumulate_dataframes_vertical};
-use crate::POOL;
 
 pub mod aggregations;
 pub mod expr;
 pub(crate) mod hashing;
 mod into_groups;
-mod perfect;
-mod proxy;
+mod position;
 
 pub use into_groups::*;
-pub use proxy::*;
+pub use position::*;
 
-use crate::prelude::sort::arg_sort_multiple::{
+use crate::chunked_array::ops::row_encode::{
     encode_rows_unordered, encode_rows_vertical_par_unordered,
 };
 
@@ -31,27 +31,29 @@ impl DataFrame {
         mut by: Vec<Column>,
         multithreaded: bool,
         sorted: bool,
-    ) -> PolarsResult<GroupBy> {
+    ) -> PolarsResult<GroupBy<'_>> {
         polars_ensure!(
             !by.is_empty(),
             ComputeError: "at least one key is required in a group_by operation"
         );
-        let minimal_by_len = by.iter().map(|s| s.len()).min().expect("at least 1 key");
-        let df_height = self.height();
 
-        // we only throw this error if self.width > 0
-        // so that we can still call this on a dummy dataframe where we provide the keys
-        if (minimal_by_len != df_height) && (self.width() > 0) {
-            polars_ensure!(
-                minimal_by_len == 1,
-                ShapeMismatch: "series used as keys should have the same length as the DataFrame"
-            );
-            for by_key in by.iter_mut() {
-                if by_key.len() == minimal_by_len {
-                    *by_key = by_key.new_from_index(0, df_height)
-                }
-            }
+        // Ensure all 'by' columns have the same common_height
+        // The condition self.width > 0 ensures we can still call this on a
+        // dummy dataframe where we provide the keys
+        let common_height = if self.width() > 0 {
+            self.height()
+        } else {
+            by.iter().map(|s| s.len()).max().expect("at least 1 key")
         };
+        for by_key in by.iter_mut() {
+            if by_key.len() != common_height {
+                polars_ensure!(
+                    by_key.len() == 1,
+                    ShapeMismatch: "series used as keys should have the same length as the DataFrame"
+                );
+                *by_key = by_key.new_from_index(0, common_height)
+            }
+        }
 
         let groups = if by.len() == 1 {
             let column = &by[0];
@@ -76,7 +78,7 @@ impl DataFrame {
             let by = by
                 .iter()
                 .filter(|s| !s.dtype().is_null())
-                .map(|c| c.as_materialized_series().clone())
+                .cloned()
                 .collect::<Vec<_>>();
             if by.is_empty() {
                 let groups = if self.is_empty() {
@@ -84,7 +86,7 @@ impl DataFrame {
                 } else {
                     vec![[0, self.height() as IdxSize]]
                 };
-                Ok(GroupsProxy::Slice {
+                Ok(GroupsType::Slice {
                     groups,
                     rolling: false,
                 })
@@ -98,7 +100,7 @@ impl DataFrame {
                 rows.group_tuples(multithreaded, sorted)
             }
         };
-        Ok(GroupBy::new(self, by, groups?, None))
+        Ok(GroupBy::new(self, by, groups?.into_sliceable(), None))
     }
 
     /// Group DataFrame using a Series column.
@@ -113,7 +115,7 @@ impl DataFrame {
     ///     .sum()
     /// }
     /// ```
-    pub fn group_by<I, S>(&self, by: I) -> PolarsResult<GroupBy>
+    pub fn group_by<I, S>(&self, by: I) -> PolarsResult<GroupBy<'_>>
     where
         I: IntoIterator<Item = S>,
         S: Into<PlSmallStr>,
@@ -124,7 +126,7 @@ impl DataFrame {
 
     /// Group DataFrame using a Series column.
     /// The groups are ordered by their smallest row index.
-    pub fn group_by_stable<I, S>(&self, by: I) -> PolarsResult<GroupBy>
+    pub fn group_by_stable<I, S>(&self, by: I) -> PolarsResult<GroupBy<'_>>
     where
         I: IntoIterator<Item = S>,
         S: Into<PlSmallStr>,
@@ -184,20 +186,20 @@ impl DataFrame {
 /// ```
 ///
 #[derive(Debug, Clone)]
-pub struct GroupBy<'df> {
-    pub df: &'df DataFrame,
+pub struct GroupBy<'a> {
+    pub df: &'a DataFrame,
     pub(crate) selected_keys: Vec<Column>,
     // [first idx, [other idx]]
-    groups: GroupsProxy,
+    groups: GroupPositions,
     // columns selected for aggregation
     pub(crate) selected_agg: Option<Vec<PlSmallStr>>,
 }
 
-impl<'df> GroupBy<'df> {
+impl<'a> GroupBy<'a> {
     pub fn new(
-        df: &'df DataFrame,
+        df: &'a DataFrame,
         by: Vec<Column>,
-        groups: GroupsProxy,
+        groups: GroupPositions,
         selected_agg: Option<Vec<PlSmallStr>>,
     ) -> Self {
         GroupBy {
@@ -223,7 +225,7 @@ impl<'df> GroupBy<'df> {
     /// The Vec returned contains:
     ///     (first_idx, [`Vec<indexes>`])
     ///     Where second value in the tuple is a vector with all matching indexes.
-    pub fn get_groups(&self) -> &GroupsProxy {
+    pub fn get_groups(&self) -> &GroupPositions {
         &self.groups
     }
 
@@ -233,17 +235,17 @@ impl<'df> GroupBy<'df> {
     ///     Where second value in the tuple is a vector with all matching indexes.
     ///
     /// # Safety
-    /// Groups should always be in bounds of the `DataFrame` hold by this `[GroupBy]`.
+    /// Groups should always be in bounds of the `DataFrame` hold by this [`GroupBy`].
     /// If you mutate it, you must hold that invariant.
-    pub unsafe fn get_groups_mut(&mut self) -> &mut GroupsProxy {
+    pub unsafe fn get_groups_mut(&mut self) -> &mut GroupPositions {
         &mut self.groups
     }
 
-    pub fn take_groups(self) -> GroupsProxy {
+    pub fn take_groups(self) -> GroupPositions {
         self.groups
     }
 
-    pub fn take_groups_mut(&mut self) -> GroupsProxy {
+    pub fn take_groups_mut(&mut self) -> GroupPositions {
         std::mem::take(&mut self.groups)
     }
 
@@ -258,14 +260,13 @@ impl<'df> GroupBy<'df> {
         } else {
             &self.groups
         };
-
         POOL.install(|| {
             self.selected_keys
                 .par_iter()
                 .map(Column::as_materialized_series)
                 .map(|s| {
                     match groups {
-                        GroupsProxy::Idx(groups) => {
+                        GroupsType::Idx(groups) => {
                             // SAFETY: groups are always in bounds.
                             let mut out = unsafe { s.take_slice_unchecked(groups.first()) };
                             if groups.sorted {
@@ -273,7 +274,7 @@ impl<'df> GroupBy<'df> {
                             };
                             out
                         },
-                        GroupsProxy::Slice { groups, rolling } => {
+                        GroupsType::Slice { groups, rolling } => {
                             if *rolling && !groups.is_empty() {
                                 // Groups can be sliced.
                                 let offset = groups[0][0];
@@ -594,18 +595,13 @@ impl<'df> GroupBy<'df> {
     ///
     /// ```rust
     /// # use polars_core::prelude::*;
-    /// # use arrow::legacy::prelude::QuantileInterpolOptions;
     ///
     /// fn example(df: DataFrame) -> PolarsResult<DataFrame> {
-    ///     df.group_by(["date"])?.select(["temp"]).quantile(0.2, QuantileInterpolOptions::default())
+    ///     df.group_by(["date"])?.select(["temp"]).quantile(0.2, QuantileMethod::default())
     /// }
     /// ```
     #[deprecated(since = "0.24.1", note = "use polars.lazy aggregations")]
-    pub fn quantile(
-        &self,
-        quantile: f64,
-        interpol: QuantileInterpolOptions,
-    ) -> PolarsResult<DataFrame> {
+    pub fn quantile(&self, quantile: f64, method: QuantileMethod) -> PolarsResult<DataFrame> {
         polars_ensure!(
             (0.0..=1.0).contains(&quantile),
             ComputeError: "`quantile` should be within 0.0 and 1.0"
@@ -614,9 +610,9 @@ impl<'df> GroupBy<'df> {
         for agg_col in agg_cols {
             let new_name = fmt_group_by_column(
                 agg_col.name().as_str(),
-                GroupByMethod::Quantile(quantile, interpol),
+                GroupByMethod::Quantile(quantile, method),
             );
-            let mut agg = unsafe { agg_col.agg_quantile(&self.groups, quantile, interpol) };
+            let mut agg = unsafe { agg_col.agg_quantile(&self.groups, quantile, method) };
             agg.rename(new_name);
             cols.push(agg);
         }
@@ -795,7 +791,7 @@ impl<'df> GroupBy<'df> {
                 new_cols.extend_from_slice(&self.selected_keys);
                 let cols = self.df.select_columns_impl(agg.as_slice())?;
                 new_cols.extend(cols);
-                Ok(unsafe { DataFrame::new_no_checks(new_cols) })
+                Ok(unsafe { DataFrame::new_no_checks(self.df.height(), new_cols) })
             }
         } else {
             Ok(self.df.clone())
@@ -846,6 +842,17 @@ impl<'df> GroupBy<'df> {
         df.as_single_chunk_par();
         Ok(df)
     }
+
+    pub fn sliced(mut self, slice: Option<(i64, usize)>) -> Self {
+        match slice {
+            None => self,
+            Some((offset, length)) => {
+                self.groups = self.groups.slice(offset, length);
+                self.selected_keys = self.keys_sliced(slice);
+                self
+            },
+        }
+    }
 }
 
 unsafe fn take_df(df: &DataFrame, g: GroupsIndicator) -> DataFrame {
@@ -868,7 +875,7 @@ pub enum GroupByMethod {
     Sum,
     Groups,
     NUnique,
-    Quantile(f64, QuantileInterpolOptions),
+    Quantile(f64, QuantileMethod),
     Count { include_nulls: bool },
     Implode,
     Std(u8),
@@ -1110,7 +1117,7 @@ mod test {
         .unwrap();
 
         df.apply("foo", |s| {
-            s.cast(&DataType::Categorical(None, Default::default()))
+            s.cast(&DataType::from_categories(Categories::global()))
                 .unwrap()
         })
         .unwrap();
@@ -1191,7 +1198,7 @@ mod test {
         ]?;
 
         df.try_apply("g", |s| {
-            s.cast(&DataType::Categorical(None, Default::default()))
+            s.cast(&DataType::from_categories(Categories::global()))
         })?;
 
         // Use of deprecated `sum()` for testing purposes

@@ -3,7 +3,7 @@ use arrow_format::ipc;
 
 use super::super::compression;
 use super::super::endianness::is_native_little_endian;
-use super::common::{pad_to_64, Compression};
+use super::common::{Compression, pad_to_64};
 use crate::array::*;
 use crate::bitmap::Bitmap;
 use crate::datatypes::PhysicalType;
@@ -216,8 +216,8 @@ fn write_bytes(
             Compression::LZ4 => {
                 compression::compress_lz4(bytes, arrow_data).unwrap();
             },
-            Compression::ZSTD => {
-                compression::compress_zstd(bytes, arrow_data).unwrap();
+            Compression::ZSTD(level) => {
+                compression::compress_zstd(bytes, arrow_data, level).unwrap();
             },
         }
     } else {
@@ -283,7 +283,7 @@ fn _write_buffer_from_iter<T: NativeType, I: TrustedLen<Item = T>>(
     is_little_endian: bool,
 ) {
     let len = buffer.size_hint().0;
-    arrow_data.reserve(len * std::mem::size_of::<T>());
+    arrow_data.reserve(len * size_of::<T>());
     if is_little_endian {
         buffer
             .map(|x| T::to_le_bytes(&x))
@@ -303,7 +303,7 @@ fn _write_compressed_buffer_from_iter<T: NativeType, I: TrustedLen<Item = T>>(
     compression: Compression,
 ) {
     let len = buffer.size_hint().0;
-    let mut swapped = Vec::with_capacity(len * std::mem::size_of::<T>());
+    let mut swapped = Vec::with_capacity(len * size_of::<T>());
     if is_little_endian {
         buffer
             .map(|x| T::to_le_bytes(&x))
@@ -318,8 +318,8 @@ fn _write_compressed_buffer_from_iter<T: NativeType, I: TrustedLen<Item = T>>(
         Compression::LZ4 => {
             compression::compress_lz4(&swapped, arrow_data).unwrap();
         },
-        Compression::ZSTD => {
-            compression::compress_zstd(&swapped, arrow_data).unwrap();
+        Compression::ZSTD(level) => {
+            compression::compress_zstd(&swapped, arrow_data, level).unwrap();
         },
     }
 }
@@ -347,8 +347,8 @@ fn _write_compressed_buffer<T: NativeType>(
             Compression::LZ4 => {
                 compression::compress_lz4(bytes, arrow_data).unwrap();
             },
-            Compression::ZSTD => {
-                compression::compress_zstd(bytes, arrow_data).unwrap();
+            Compression::ZSTD(level) => {
+                compression::compress_zstd(bytes, arrow_data, level).unwrap();
             },
         }
     } else {

@@ -1,18 +1,18 @@
 //! Contains functionality to load an ArrayData from the C Data Interface
 use std::sync::Arc;
 
-use polars_error::{polars_bail, PolarsResult};
+use polars_error::{PolarsResult, polars_bail};
 
 use super::ArrowArray;
 use crate::array::*;
-use crate::bitmap::utils::bytes_for;
 use crate::bitmap::Bitmap;
+use crate::bitmap::utils::bytes_for;
 use crate::buffer::Buffer;
 use crate::datatypes::{ArrowDataType, PhysicalType};
 use crate::ffi::schema::get_child;
 use crate::storage::SharedStorage;
-use crate::types::NativeType;
-use crate::{match_integer_type, with_match_primitive_type_full};
+use crate::types::{NativeType, PrimitiveType, months_days_ns};
+use crate::{ffi, match_integer_type, with_match_primitive_type_full};
 
 /// Reads a valid `ffi` interface into a `Box<dyn Array>`
 /// # Errors
@@ -23,6 +23,9 @@ pub unsafe fn try_from<A: ArrowArrayRef>(array: A) -> PolarsResult<Box<dyn Array
     Ok(match array.dtype().to_physical_type() {
         Null => Box::new(NullArray::try_from_ffi(array)?),
         Boolean => Box::new(BooleanArray::try_from_ffi(array)?),
+        Primitive(PrimitiveType::MonthDayNano) => {
+            Box::new(PrimitiveArray::<months_days_ns>::try_from_ffi(array)?)
+        },
         Primitive(primitive) => with_match_primitive_type_full!(primitive, |$T| {
             Box::new(PrimitiveArray::<$T>::try_from_ffi(array)?)
         }),
@@ -99,34 +102,26 @@ impl ArrowArray {
     /// This method releases `buffers`. Consumers of this struct *must* call `release` before
     /// releasing this struct, or contents in `buffers` leak.
     pub(crate) fn new(array: Box<dyn Array>) -> Self {
-        let needs_variadic_buffer_sizes = matches!(
-            array.dtype(),
-            ArrowDataType::BinaryView | ArrowDataType::Utf8View
-        );
-
+        #[allow(unused_mut)]
         let (offset, mut buffers, children, dictionary) =
             offset_buffers_children_dictionary(array.as_ref());
 
-        let variadic_buffer_sizes = if needs_variadic_buffer_sizes {
-            #[cfg(feature = "compute_cast")]
-            {
-                let arr = crate::compute::cast::cast_unchecked(
-                    array.as_ref(),
-                    &ArrowDataType::BinaryView,
-                )
-                .unwrap();
-                let arr = arr.as_any().downcast_ref::<BinaryViewArray>().unwrap();
+        let variadic_buffer_sizes = match array.dtype() {
+            ArrowDataType::BinaryView => {
+                let arr = array.as_any().downcast_ref::<BinaryViewArray>().unwrap();
                 let boxed = arr.variadic_buffer_lengths().into_boxed_slice();
                 let ptr = boxed.as_ptr().cast::<u8>();
                 buffers.push(Some(ptr));
                 boxed
-            }
-            #[cfg(not(feature = "compute_cast"))]
-            {
-                panic!("activate 'compute_cast' feature")
-            }
-        } else {
-            Box::from([])
+            },
+            ArrowDataType::Utf8View => {
+                let arr = array.as_any().downcast_ref::<Utf8ViewArray>().unwrap();
+                let boxed = arr.variadic_buffer_lengths().into_boxed_slice();
+                let ptr = boxed.as_ptr().cast::<u8>();
+                buffers.push(Some(ptr));
+                boxed
+            },
+            _ => Box::new([]),
         };
 
         let buffers_ptr = buffers
@@ -140,12 +135,19 @@ impl ArrowArray {
 
         let children_ptr = children
             .into_iter()
-            .map(|child| Box::into_raw(Box::new(ArrowArray::new(child))))
+            .map(|child| {
+                Box::into_raw(Box::new(ArrowArray::new(ffi::align_to_c_data_interface(
+                    child,
+                ))))
+            })
             .collect::<Box<_>>();
         let n_children = children_ptr.len() as i64;
 
-        let dictionary_ptr =
-            dictionary.map(|array| Box::into_raw(Box::new(ArrowArray::new(array))));
+        let dictionary_ptr = dictionary.map(|array| {
+            Box::into_raw(Box::new(ArrowArray::new(ffi::align_to_c_data_interface(
+                array,
+            ))))
+        });
 
         let length = array.len() as i64;
         let null_count = array.null_count() as i64;
@@ -217,11 +219,7 @@ unsafe fn get_buffer_ptr<T: NativeType>(
         );
     }
 
-    if array
-        .buffers
-        .align_offset(std::mem::align_of::<*mut *const u8>())
-        != 0
-    {
+    if array.buffers.align_offset(align_of::<*mut *const u8>()) != 0 {
         polars_bail!( ComputeError:
             "an ArrowArray of type {dtype:?}
             must have buffer {index} aligned to type {}",
@@ -257,6 +255,8 @@ unsafe fn create_buffer_known_len<T: NativeType>(
     index: usize,
 ) -> PolarsResult<Buffer<T>> {
     if len == 0 {
+        // Zero-length arrays might have invalid pointers for zero-length slices in Rust,
+        // so this is more than just an optimization.
         return Ok(Buffer::new());
     }
     let ptr: *mut T = get_buffer_ptr(array, dtype, index)?;
@@ -278,6 +278,8 @@ unsafe fn create_buffer<T: NativeType>(
     let len = buffer_len(array, dtype, index)?;
 
     if len == 0 {
+        // Zero-length arrays might have invalid pointers for zero-length slices in Rust,
+        // so this is more than just an optimization.
         return Ok(Buffer::new());
     }
 
@@ -286,7 +288,7 @@ unsafe fn create_buffer<T: NativeType>(
 
     // We have to check alignment.
     // This is the zero-copy path.
-    if ptr.align_offset(std::mem::align_of::<T>()) == 0 {
+    if ptr.align_offset(align_of::<T>()) == 0 {
         let storage = SharedStorage::from_internal_arrow_array(ptr, len, owner);
         Ok(Buffer::from_storage(storage).sliced(offset, len - offset))
     }
@@ -314,6 +316,8 @@ unsafe fn create_bitmap(
 ) -> PolarsResult<Bitmap> {
     let len: usize = array.length.try_into().expect("length to fit in `usize`");
     if len == 0 {
+        // Zero-length arrays might have invalid pointers for zero-length slices in Rust,
+        // so this is more than just an optimization.
         return Ok(Bitmap::new());
     }
     let ptr = get_buffer_ptr(array, dtype, index)?;
@@ -528,11 +532,11 @@ pub trait ArrowArrayRef: std::fmt::Debug {
     /// * `array.children` is not mutably shared for the lifetime of `parent`
     /// * the pointer of `array.children` at `index` is valid
     /// * the pointer of `array.children` at `index` is not mutably shared for the lifetime of `parent`
-    unsafe fn child(&self, index: usize) -> PolarsResult<ArrowArrayChild> {
+    unsafe fn child(&self, index: usize) -> PolarsResult<ArrowArrayChild<'_>> {
         create_child(self.array(), self.dtype(), self.parent().clone(), index)
     }
 
-    unsafe fn dictionary(&self) -> PolarsResult<Option<ArrowArrayChild>> {
+    unsafe fn dictionary(&self) -> PolarsResult<Option<ArrowArrayChild<'_>>> {
         create_dictionary(self.array(), self.dtype(), self.parent().clone())
     }
 
@@ -616,7 +620,7 @@ pub struct ArrowArrayChild<'a> {
     parent: InternalArrowArray,
 }
 
-impl<'a> ArrowArrayRef for ArrowArrayChild<'a> {
+impl ArrowArrayRef for ArrowArrayChild<'_> {
     /// the dtype as declared in the schema
     fn dtype(&self) -> &ArrowDataType {
         &self.dtype

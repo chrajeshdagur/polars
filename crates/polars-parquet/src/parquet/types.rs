@@ -1,7 +1,19 @@
+use arrow::types::{AlignedBytes, Bytes4Alignment4, Bytes8Alignment8, Bytes12Alignment4};
+
 use crate::parquet::schema::types::PhysicalType;
+use crate::read::expr::ParquetScalar;
 
 /// A physical native representation of a Parquet fixed-sized type.
-pub trait NativeType: std::fmt::Debug + Send + Sync + 'static + Copy + Clone {
+pub trait NativeType:
+    std::fmt::Debug
+    + Send
+    + Sync
+    + 'static
+    + Copy
+    + Clone
+    + bytemuck::Pod
+    + for<'a> TryFrom<&'a ParquetScalar>
+{
     type Bytes: AsRef<[u8]>
         + bytemuck::Pod
         + IntoIterator<Item = u8>
@@ -9,6 +21,7 @@ pub trait NativeType: std::fmt::Debug + Send + Sync + 'static + Copy + Clone {
         + std::fmt::Debug
         + Clone
         + Copy;
+    type AlignedBytes: AlignedBytes<Unaligned = Self::Bytes> + From<Self> + Into<Self>;
 
     fn to_le_bytes(&self) -> Self::Bytes;
 
@@ -20,9 +33,23 @@ pub trait NativeType: std::fmt::Debug + Send + Sync + 'static + Copy + Clone {
 }
 
 macro_rules! native {
-    ($type:ty, $physical_type:expr) => {
+    ($type:ty, $unaligned:ty, $physical_type:expr$(, $pq_scalar:ident)?) => {
+        impl TryFrom<&ParquetScalar> for $type {
+            type Error = ();
+            fn try_from(value: &ParquetScalar) -> Result<$type, Self::Error> {
+                match value {
+                    $(
+                    ParquetScalar::$pq_scalar(v) => Ok(*v),
+                    )?
+                    _ => Err(()),
+                }
+            }
+        }
+
         impl NativeType for $type {
-            type Bytes = [u8; std::mem::size_of::<Self>()];
+            type Bytes = [u8; size_of::<Self>()];
+            type AlignedBytes = $unaligned;
+
             #[inline]
             fn to_le_bytes(&self) -> Self::Bytes {
                 Self::to_le_bytes(*self)
@@ -43,15 +70,29 @@ macro_rules! native {
     };
 }
 
-native!(i32, PhysicalType::Int32);
-native!(i64, PhysicalType::Int64);
-native!(f32, PhysicalType::Float);
-native!(f64, PhysicalType::Double);
+macro_rules! no_parquet_scalar_impl {
+    ($type:ty) => {
+        impl TryFrom<&ParquetScalar> for $type {
+            type Error = ();
+            fn try_from(_: &ParquetScalar) -> Result<$type, Self::Error> {
+                Err(())
+            }
+        }
+    };
+}
 
+native!(i32, Bytes4Alignment4, PhysicalType::Int32, Int32);
+native!(i64, Bytes8Alignment8, PhysicalType::Int64, Int64);
+native!(f32, Bytes4Alignment4, PhysicalType::Float, Float32);
+native!(f64, Bytes8Alignment8, PhysicalType::Double, Float64);
+
+no_parquet_scalar_impl!([u32; 3]);
 impl NativeType for [u32; 3] {
     const TYPE: PhysicalType = PhysicalType::Int96;
 
-    type Bytes = [u8; std::mem::size_of::<Self>()];
+    type Bytes = [u8; size_of::<Self>()];
+    type AlignedBytes = Bytes12Alignment4;
+
     #[inline]
     fn to_le_bytes(&self) -> Self::Bytes {
         let mut bytes = [0; 12];
@@ -137,7 +178,7 @@ pub fn ord_binary<'a>(a: &'a [u8], b: &'a [u8]) -> std::cmp::Ordering {
 
 #[inline]
 pub fn decode<T: NativeType>(chunk: &[u8]) -> T {
-    assert!(chunk.len() >= std::mem::size_of::<<T as NativeType>::Bytes>());
+    assert!(chunk.len() >= size_of::<<T as NativeType>::Bytes>());
     unsafe { decode_unchecked(chunk) }
 }
 

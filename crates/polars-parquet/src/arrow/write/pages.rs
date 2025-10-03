@@ -4,9 +4,9 @@ use arrow::array::{Array, FixedSizeListArray, ListArray, MapArray, StructArray};
 use arrow::bitmap::{Bitmap, MutableBitmap};
 use arrow::datatypes::PhysicalType;
 use arrow::offset::{Offset, OffsetsBuffer};
-use polars_error::{polars_bail, PolarsResult};
+use polars_error::{PolarsResult, polars_bail};
 
-use super::{array_to_pages, Encoding, WriteOptions};
+use super::{ColumnWriteOptions, WriteOptions, array_to_pages};
 use crate::arrow::read::schema::is_nullable;
 use crate::parquet::page::Page;
 use crate::parquet::schema::types::{ParquetType, PrimitiveType as ParquetPrimitiveType};
@@ -140,6 +140,10 @@ fn to_nested_recursive(
     mut parents: Vec<Nested>,
 ) -> PolarsResult<()> {
     let is_optional = is_nullable(type_.get_field_info());
+
+    if !is_optional && array.null_count() > 0 {
+        polars_bail!(InvalidOperation: "writing a missing value to required field '{}'", type_.name());
+    }
 
     use PhysicalType::*;
     match array.dtype().to_physical_type() {
@@ -498,27 +502,29 @@ fn to_parquet_leaves_recursive(type_: ParquetType, leaves: &mut Vec<ParquetPrimi
 pub fn array_to_columns<A: AsRef<dyn Array> + Send + Sync>(
     array: A,
     type_: ParquetType,
+    column_options: &ColumnWriteOptions,
     options: WriteOptions,
-    encoding: &[Encoding],
 ) -> PolarsResult<Vec<DynIter<'static, PolarsResult<Page>>>> {
     let array = array.as_ref();
 
     let nested = to_nested(array, &type_)?;
-
     let types = to_parquet_leaves(type_);
 
     let mut values = Vec::new();
     to_leaves(array, &mut values);
 
-    assert_eq!(encoding.len(), types.len());
+    let mut field_options = Vec::with_capacity(types.len());
+    column_options.to_leaves(&mut field_options);
+
+    assert_eq!(field_options.len(), types.len());
 
     values
         .iter()
         .zip(nested)
         .zip(types)
-        .zip(encoding.iter())
-        .map(|(((values, nested), type_), encoding)| {
-            array_to_pages(values.as_ref(), type_, &nested, options, *encoding)
+        .zip(field_options)
+        .map(|(((values, nested), type_), field_options)| {
+            array_to_pages(values.as_ref(), type_, &nested, options, field_options)
         })
         .collect()
 }
@@ -527,12 +533,15 @@ pub fn arrays_to_columns<A: AsRef<dyn Array> + Send + Sync>(
     arrays: &[A],
     type_: ParquetType,
     options: WriteOptions,
-    encoding: &[Encoding],
+    column_options: &ColumnWriteOptions,
 ) -> PolarsResult<Vec<DynIter<'static, PolarsResult<Page>>>> {
     let array = arrays[0].as_ref();
     let nested = to_nested(array, &type_)?;
 
     let types = to_parquet_leaves(type_);
+
+    let mut field_options = Vec::with_capacity(types.len());
+    column_options.to_leaves(&mut field_options);
 
     // leaves; index level is nesting depth.
     // index i: has a vec because we have multiple chunks.
@@ -554,15 +563,15 @@ pub fn arrays_to_columns<A: AsRef<dyn Array> + Send + Sync>(
         .into_iter()
         .zip(nested)
         .zip(types)
-        .zip(encoding.iter())
-        .map(move |(((values, nested), type_), encoding)| {
+        .zip(field_options)
+        .map(move |(((values, nested), type_), column_options)| {
             let iter = values.into_iter().map(|leave_values| {
                 array_to_pages(
                     leave_values.as_ref(),
                     type_.clone(),
                     &nested,
                     options,
-                    *encoding,
+                    column_options,
                 )
             });
 
@@ -583,10 +592,10 @@ mod tests {
 
     use super::super::{FieldInfo, ParquetPhysicalType};
     use super::*;
+    use crate::parquet::schema::Repetition;
     use crate::parquet::schema::types::{
         GroupLogicalType, PrimitiveConvertedType, PrimitiveLogicalType,
     };
-    use crate::parquet::schema::Repetition;
 
     #[test]
     fn test_struct() {
@@ -600,6 +609,7 @@ mod tests {
 
         let array = StructArray::new(
             ArrowDataType::Struct(fields),
+            4,
             vec![boolean.clone(), int.clone()],
             Some(Bitmap::from([true, true, false, true])),
         );
@@ -664,6 +674,7 @@ mod tests {
 
         let array = StructArray::new(
             ArrowDataType::Struct(fields),
+            4,
             vec![boolean.clone(), int.clone()],
             Some(Bitmap::from([true, true, false, true])),
         );
@@ -675,6 +686,7 @@ mod tests {
 
         let array = StructArray::new(
             ArrowDataType::Struct(fields),
+            4,
             vec![Box::new(array.clone()), Box::new(array)],
             None,
         );
@@ -767,6 +779,7 @@ mod tests {
 
         let array = StructArray::new(
             ArrowDataType::Struct(fields),
+            4,
             vec![boolean.clone(), int.clone()],
             Some(Bitmap::from([true, true, false, true])),
         );
@@ -872,7 +885,7 @@ mod tests {
 
         let key_array = Utf8Array::<i32>::from_slice(["k1", "k2", "k3", "k4", "k5", "k6"]).boxed();
         let val_array = Int32Array::from_slice([42, 28, 19, 31, 21, 17]).boxed();
-        let kv_array = StructArray::try_new(kv_type, vec![key_array, val_array], None)
+        let kv_array = StructArray::try_new(kv_type, 6, vec![key_array, val_array], None)
             .unwrap()
             .boxed();
         let offsets = OffsetsBuffer::try_from(vec![0, 2, 3, 4, 6]).unwrap();

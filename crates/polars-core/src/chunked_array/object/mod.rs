@@ -1,9 +1,10 @@
+#![allow(unsafe_op_in_unsafe_fn)]
 use std::any::Any;
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
 
+use arrow::bitmap::Bitmap;
 use arrow::bitmap::utils::{BitmapIter, ZipValidity};
-use arrow::bitmap::{Bitmap, MutableBitmap};
 use arrow::buffer::Buffer;
 use polars_utils::total_ord::TotalHash;
 
@@ -84,7 +85,7 @@ where
     }
 
     /// Returns an iterator of `Option<&T>` over every element of this array.
-    pub fn iter(&self) -> ZipValidity<&T, ObjectValueIter<'_, T>, BitmapIter> {
+    pub fn iter(&self) -> ZipValidity<&T, ObjectValueIter<'_, T>, BitmapIter<'_>> {
         ZipValidity::new_with_validity(self.values_iter(), self.validity.as_ref())
     }
 
@@ -145,7 +146,7 @@ where
 
     /// Sets the validity of this array.
     /// # Panics
-    /// This function panics iff `values.len() != self.len()`.
+    /// This function panics iff `validity.len() != self.len()`.
     #[inline]
     pub fn set_validity(&mut self, validity: Option<Bitmap>) {
         if matches!(&validity, Some(bitmap) if bitmap.len() != self.len()) {
@@ -164,7 +165,7 @@ where
     }
 
     fn dtype(&self) -> &ArrowDataType {
-        &ArrowDataType::FixedSizeBinary(std::mem::size_of::<T>())
+        &ArrowDataType::FixedSizeBinary(size_of::<T>())
     }
 
     fn slice(&mut self, offset: usize, length: usize) {
@@ -257,7 +258,7 @@ impl<T: PolarsObject> StaticArray for ObjectArray<T> {
         self.values_iter()
     }
 
-    fn iter(&self) -> ZipValidity<Self::ValueT<'_>, Self::ValueIterT<'_>, BitmapIter> {
+    fn iter(&self) -> ZipValidity<Self::ValueT<'_>, Self::ValueIterT<'_>, BitmapIter<'_>> {
         self.iter()
     }
 
@@ -275,7 +276,7 @@ impl<T: PolarsObject> StaticArray for ObjectArray<T> {
 
 impl<T: PolarsObject> ParameterFreeDtypeStaticArray for ObjectArray<T> {
     fn get_dtype() -> ArrowDataType {
-        ArrowDataType::FixedSizeBinary(std::mem::size_of::<T>())
+        ArrowDataType::FixedSizeBinary(size_of::<T>())
     }
 }
 

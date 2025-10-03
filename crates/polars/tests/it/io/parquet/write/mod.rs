@@ -4,9 +4,9 @@ mod sidecar;
 
 use std::io::{Cursor, Read, Seek};
 
+use polars::io::SerReader;
 use polars::io::parquet::read::ParquetReader;
 use polars::io::parquet::write::ParquetWriter;
-use polars::io::SerReader;
 use polars_core::df;
 use polars_core::prelude::*;
 use polars_parquet::parquet::compression::{BrotliLevel, CompressionOptions};
@@ -22,7 +22,7 @@ use polars_parquet::read::read_metadata;
 use polars_utils::mmap::MemReader;
 use primitive::array_to_page_v1;
 
-use super::{alltypes_plain, alltypes_statistics, Array};
+use super::{Array, alltypes_plain, alltypes_statistics};
 
 pub fn array_to_page(
     array: &Array,
@@ -215,6 +215,7 @@ fn basic() -> ParquetResult<()> {
     assert_eq!(
         metadata.row_groups[0]
             .columns_under_root_iter("col")
+            .unwrap()
             .next()
             .unwrap()
             .uncompressed_size(),

@@ -1,11 +1,10 @@
+#![allow(unsafe_op_in_unsafe_fn)]
 use std::ptr::NonNull;
 use std::rc::Rc;
 
-use polars_utils::unwrap::UnwrapUncheckedRelease;
-
 use crate::prelude::*;
 
-/// A `[Series]` that amortizes a few allocations during iteration.
+/// A [`Series`] that amortizes a few allocations during iteration.
 #[derive(Clone)]
 pub struct AmortSeries {
     container: Rc<Series>,
@@ -33,7 +32,7 @@ impl AmortSeries {
         }
     }
 
-    /// Creates a new `[UnsafeSeries]`
+    /// Creates a new [`UnsafeSeries`]
     ///
     /// # Safety
     /// Inner chunks must be from `Series` otherwise the dtype may be incorrect and lead to UB.
@@ -41,8 +40,7 @@ impl AmortSeries {
     pub(crate) unsafe fn new_with_chunk(series: Rc<Series>, inner_chunk: &ArrayRef) -> Self {
         AmortSeries {
             container: series,
-            inner: NonNull::new(inner_chunk as *const ArrayRef as *mut ArrayRef)
-                .unwrap_unchecked_release(),
+            inner: NonNull::new(inner_chunk as *const ArrayRef as *mut ArrayRef).unwrap_unchecked(),
         }
     }
 
@@ -52,7 +50,7 @@ impl AmortSeries {
             debug_assert_eq!(s.chunks().len(), 1);
             let array_ref = s.chunks().get_unchecked(0).clone();
             let name = s.name().clone();
-            Series::from_chunks_and_dtype_unchecked(name.clone(), vec![array_ref], s.dtype())
+            Series::from_chunks_and_dtype_unchecked(name, vec![array_ref], s.dtype())
         }
     }
 

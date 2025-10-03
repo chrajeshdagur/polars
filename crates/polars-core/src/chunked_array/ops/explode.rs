@@ -1,14 +1,14 @@
+#![allow(unsafe_op_in_unsafe_fn)]
 use arrow::array::*;
 use arrow::bitmap::utils::set_bit_unchecked;
 use arrow::bitmap::{Bitmap, MutableBitmap};
 use arrow::legacy::prelude::*;
-use polars_utils::slice::GetSaferUnchecked;
 
 use crate::prelude::*;
 use crate::series::implementations::null::NullChunked;
 
 pub(crate) trait ExplodeByOffsets {
-    fn explode_by_offsets(&self, offsets: &[i64]) -> Series;
+    fn explode_by_offsets(&self, offsets: &[i64], skip_empty: bool) -> Series;
 }
 
 unsafe fn unset_nulls(
@@ -34,7 +34,7 @@ impl<T> ExplodeByOffsets for ChunkedArray<T>
 where
     T: PolarsIntegerType,
 {
-    fn explode_by_offsets(&self, offsets: &[i64]) -> Series {
+    fn explode_by_offsets(&self, offsets: &[i64], skip_empty: bool) -> Series {
         debug_assert_eq!(self.chunks.len(), 1);
         let arr = self.downcast_iter().next().unwrap();
 
@@ -67,7 +67,7 @@ where
 
             for &o in &offsets[1..] {
                 let o = o as usize;
-                if o == last {
+                if !skip_empty && o == last {
                     if start != last {
                         #[cfg(debug_assertions)]
                         new_values.extend_from_slice(&values[start..last]);
@@ -114,11 +114,9 @@ where
         } else {
             for &o in &offsets[1..] {
                 let o = o as usize;
-                if o == last {
+                if !skip_empty && o == last {
                     if start != last {
-                        unsafe {
-                            new_values.extend_from_slice(values.get_unchecked_release(start..last))
-                        };
+                        unsafe { new_values.extend_from_slice(values.get_unchecked(start..last)) };
                     }
 
                     empty_row_idx.push(o + empty_row_idx.len() - base_offset);
@@ -143,7 +141,7 @@ where
             unsafe { set_bit_unchecked(validity_slice, i, false) }
         }
         let arr = PrimitiveArray::new(
-            T::get_dtype().to_arrow(CompatLevel::newest()),
+            T::get_static_dtype().to_arrow(CompatLevel::newest()),
             new_values.into(),
             Some(validity.into()),
         );
@@ -152,31 +150,31 @@ where
 }
 
 impl ExplodeByOffsets for Float32Chunked {
-    fn explode_by_offsets(&self, offsets: &[i64]) -> Series {
+    fn explode_by_offsets(&self, offsets: &[i64], skip_empty: bool) -> Series {
         self.apply_as_ints(|s| {
             let ca = s.u32().unwrap();
-            ca.explode_by_offsets(offsets)
+            ca.explode_by_offsets(offsets, skip_empty)
         })
     }
 }
 impl ExplodeByOffsets for Float64Chunked {
-    fn explode_by_offsets(&self, offsets: &[i64]) -> Series {
+    fn explode_by_offsets(&self, offsets: &[i64], skip_empty: bool) -> Series {
         self.apply_as_ints(|s| {
             let ca = s.u64().unwrap();
-            ca.explode_by_offsets(offsets)
+            ca.explode_by_offsets(offsets, skip_empty)
         })
     }
 }
 
 impl ExplodeByOffsets for NullChunked {
-    fn explode_by_offsets(&self, offsets: &[i64]) -> Series {
+    fn explode_by_offsets(&self, offsets: &[i64], skip_empty: bool) -> Series {
         let mut last_offset = offsets[0];
 
         let mut len = 0;
         for &offset in &offsets[1..] {
             // If offset == last_offset we have an empty list and a new row is inserted,
             // therefore we always increase at least 1.
-            len += std::cmp::max(offset - last_offset, 1) as usize;
+            len += std::cmp::max(offset - last_offset, i64::from(!skip_empty)) as usize;
             last_offset = offset;
         }
         NullChunked::new(self.name.clone(), len).into_series()
@@ -184,7 +182,7 @@ impl ExplodeByOffsets for NullChunked {
 }
 
 impl ExplodeByOffsets for BooleanChunked {
-    fn explode_by_offsets(&self, offsets: &[i64]) -> Series {
+    fn explode_by_offsets(&self, offsets: &[i64], skip_empty: bool) -> Series {
         debug_assert_eq!(self.chunks.len(), 1);
         let arr = self.downcast_iter().next().unwrap();
 
@@ -195,7 +193,7 @@ impl ExplodeByOffsets for BooleanChunked {
         let mut last = start;
         for &o in &offsets[1..] {
             let o = o as usize;
-            if o == last {
+            if !skip_empty && o == last {
                 if start != last {
                     let vals = arr.slice_typed(start, last - start);
 
@@ -269,7 +267,7 @@ mod test {
 
     #[test]
     fn test_explode_list() -> PolarsResult<()> {
-        let mut builder = get_list_builder(&DataType::Int32, 5, 5, PlSmallStr::from_static("a"))?;
+        let mut builder = get_list_builder(&DataType::Int32, 5, 5, PlSmallStr::from_static("a"));
 
         builder
             .append_series(&Series::new(PlSmallStr::EMPTY, &[1, 2, 3, 3]))
@@ -285,12 +283,12 @@ mod test {
         assert!(ca._can_fast_explode());
 
         // normal explode
-        let exploded = ca.explode()?;
+        let exploded = ca.explode(false)?;
         let out: Vec<_> = exploded.i32()?.into_no_null_iter().collect();
         assert_eq!(out, &[1, 2, 3, 3, 1, 2]);
 
         // sliced explode
-        let exploded = ca.slice(0, 1).explode()?;
+        let exploded = ca.slice(0, 1).explode(false)?;
         let out: Vec<_> = exploded.i32()?.into_no_null_iter().collect();
         assert_eq!(out, &[1, 2, 3, 3]);
 
@@ -300,7 +298,7 @@ mod test {
     #[test]
     fn test_explode_empty_list_slot() -> PolarsResult<()> {
         // primitive
-        let mut builder = get_list_builder(&DataType::Int32, 5, 5, PlSmallStr::from_static("a"))?;
+        let mut builder = get_list_builder(&DataType::Int32, 5, 5, PlSmallStr::from_static("a"));
         builder
             .append_series(&Series::new(PlSmallStr::EMPTY, &[1i32, 2]))
             .unwrap();
@@ -312,14 +310,14 @@ mod test {
             .unwrap();
 
         let ca = builder.finish();
-        let exploded = ca.explode()?;
+        let exploded = ca.explode(false)?;
         assert_eq!(
             Vec::from(exploded.i32()?),
             &[Some(1), Some(2), None, Some(3)]
         );
 
         // more primitive
-        let mut builder = get_list_builder(&DataType::Int32, 5, 5, PlSmallStr::from_static("a"))?;
+        let mut builder = get_list_builder(&DataType::Int32, 5, 5, PlSmallStr::from_static("a"));
         builder
             .append_series(&Series::new(PlSmallStr::EMPTY, &[1i32]))
             .unwrap();
@@ -337,14 +335,14 @@ mod test {
             .unwrap();
 
         let ca = builder.finish();
-        let exploded = ca.explode()?;
+        let exploded = ca.explode(false)?;
         assert_eq!(
             Vec::from(exploded.i32()?),
             &[Some(1), None, Some(2), None, Some(3), Some(4)]
         );
 
         // string
-        let mut builder = get_list_builder(&DataType::String, 5, 5, PlSmallStr::from_static("a"))?;
+        let mut builder = get_list_builder(&DataType::String, 5, 5, PlSmallStr::from_static("a"));
         builder
             .append_series(&Series::new(PlSmallStr::EMPTY, &["abc"]))
             .unwrap();
@@ -383,14 +381,14 @@ mod test {
             .unwrap();
 
         let ca = builder.finish();
-        let exploded = ca.explode()?;
+        let exploded = ca.explode(false)?;
         assert_eq!(
             Vec::from(exploded.str()?),
             &[Some("abc"), None, Some("de"), None, Some("fg"), None]
         );
 
         // boolean
-        let mut builder = get_list_builder(&DataType::Boolean, 5, 5, PlSmallStr::from_static("a"))?;
+        let mut builder = get_list_builder(&DataType::Boolean, 5, 5, PlSmallStr::from_static("a"));
         builder
             .append_series(&Series::new(PlSmallStr::EMPTY, &[true]))
             .unwrap();
@@ -408,7 +406,7 @@ mod test {
             .unwrap();
 
         let ca = builder.finish();
-        let exploded = ca.explode()?;
+        let exploded = ca.explode(false)?;
         assert_eq!(
             Vec::from(exploded.bool()?),
             &[Some(true), None, Some(false), None, Some(true), Some(true)]
