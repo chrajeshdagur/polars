@@ -590,6 +590,7 @@ where
     pub fn deposit(&self, validity: &Bitmap) -> Self {
         let set_bits = validity.set_bits();
 
+        assert_eq!(self.null_count(), 0);
         assert_eq!(self.len(), set_bits);
 
         if set_bits == validity.len() {
@@ -628,6 +629,34 @@ impl ListChunked {
                 &self.inner_dtype().to_physical(),
             ))
         }
+    }
+
+    pub fn has_masked_out_values(&self) -> bool {
+        for arr in self.downcast_iter() {
+            if arr.is_empty() {
+                continue;
+            }
+
+            if *arr.offsets().first() != 0 || *arr.offsets().last() != arr.values().len() as i64 {
+                return true;
+            }
+
+            let Some(validity) = arr.validity() else {
+                continue;
+            };
+            if validity.set_bits() == 0 {
+                continue;
+            }
+
+            // @Performance: false_idx_iter
+            for i in (!validity).true_idx_iter() {
+                if arr.offsets().length_at(i) > 0 {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 }
 

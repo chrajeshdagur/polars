@@ -4,6 +4,7 @@ use polars_utils::format_pl_smallstr;
 use recursive::recursive;
 
 use super::*;
+use crate::constants::{PL_ELEMENT_NAME, POLARS_ELEMENT};
 
 fn validate_expr(node: Node, ctx: &ToFieldContext) -> PolarsResult<()> {
     ctx.arena.get(node).to_field_impl(ctx).map(|_| ())
@@ -40,6 +41,11 @@ impl AExpr {
         use AExpr::*;
         use DataType::*;
         match self {
+            Element => ctx
+                .schema
+                .get_field(POLARS_ELEMENT)
+                .ok_or_else(|| polars_err!(invalid_element_use)),
+
             Len => Ok(Field::new(PlSmallStr::from_static(LEN), IDX_DTYPE)),
             Window {
                 function,
@@ -133,7 +139,8 @@ impl AExpr {
                     Max { input: expr, .. }
                     | Min { input: expr, .. }
                     | First(expr)
-                    | Last(expr) => ctx.arena.get(*expr).to_field_impl(ctx),
+                    | Last(expr)
+                    | Item(expr) => ctx.arena.get(*expr).to_field_impl(ctx),
                     Sum(expr) => {
                         let mut field = ctx.arena.get(*expr).to_field_impl(ctx)?;
                         let dt = match field.dtype() {
@@ -248,16 +255,17 @@ impl AExpr {
                 let field = ctx.arena.get(*expr).to_field_impl(ctx)?;
 
                 let element_dtype = variant.element_dtype(field.dtype())?;
-                let schema = Schema::from_iter([(PlSmallStr::EMPTY, element_dtype.clone())]);
-
-                let ctx = ToFieldContext {
-                    schema: &schema,
-                    arena: ctx.arena,
-                };
-                let mut output_field = ctx.arena.get(*evaluation).to_field_impl(&ctx)?;
+                let mut evaluation_schema = ctx.schema.clone();
+                evaluation_schema.insert(PL_ELEMENT_NAME.clone(), element_dtype.clone());
+                let mut output_field = ctx
+                    .arena
+                    .get(*evaluation)
+                    .to_field_impl(&ToFieldContext::new(ctx.arena, &evaluation_schema))?;
                 output_field.dtype = output_field.dtype.materialize_unknown(false)?;
+                let eval_is_scalar = is_scalar_ae(*evaluation, ctx.arena);
 
-                output_field.dtype = variant.output_dtype(field.dtype(), output_field.dtype)?;
+                output_field.dtype =
+                    variant.output_dtype(field.dtype(), output_field.dtype, eval_is_scalar)?;
                 output_field.name = field.name;
 
                 Ok(output_field)
@@ -290,6 +298,7 @@ impl AExpr {
         use AExpr::*;
         use IRAggExpr::*;
         match self {
+            Element => PlSmallStr::EMPTY,
             Len => crate::constants::get_len_name(),
             Window {
                 function: expr,
@@ -311,6 +320,7 @@ impl AExpr {
             | Agg(Min { input: expr, .. })
             | Agg(First(expr))
             | Agg(Last(expr))
+            | Agg(Item(expr))
             | Agg(Sum(expr))
             | Agg(Median(expr))
             | Agg(Mean(expr))

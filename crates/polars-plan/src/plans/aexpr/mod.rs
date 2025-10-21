@@ -48,6 +48,7 @@ pub enum IRAggExpr {
     NUnique(Node),
     First(Node),
     Last(Node),
+    Item(Node),
     Mean(Node),
     Implode(Node),
     Quantile {
@@ -146,6 +147,7 @@ impl From<IRAggExpr> for GroupByMethod {
             NUnique(_) => GroupByMethod::NUnique,
             First(_) => GroupByMethod::First,
             Last(_) => GroupByMethod::Last,
+            Item(_) => GroupByMethod::Item,
             Mean(_) => GroupByMethod::Mean,
             Implode(_) => GroupByMethod::Implode,
             Sum(_) => GroupByMethod::Sum,
@@ -165,6 +167,10 @@ impl From<IRAggExpr> for GroupByMethod {
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "ir_serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum AExpr {
+    /// Values in a `eval` context.
+    ///
+    /// Equivalent of `pl.element()`.
+    Element,
     Explode {
         expr: Node,
         skip_empty: bool,
@@ -257,6 +263,7 @@ impl AExpr {
     #[recursive::recursive]
     pub fn is_scalar(&self, arena: &Arena<AExpr>) -> bool {
         match self {
+            AExpr::Element => false,
             AExpr::Literal(lv) => lv.is_scalar(),
             AExpr::Function { options, input, .. }
             | AExpr::AnonymousFunction { options, input, .. } => {
@@ -323,6 +330,7 @@ impl AExpr {
         }
 
         match self {
+            AExpr::Element => true,
             AExpr::Column(_) => true,
 
             AExpr::Literal(_) | AExpr::Agg(_) | AExpr::Len => false,
@@ -366,7 +374,7 @@ impl AExpr {
 
     /// Is the top-level expression fallible based on the data values.
     pub fn is_fallible_top_level(&self, arena: &Arena<AExpr>) -> bool {
-        #[expect(clippy::collapsible_match, clippy::match_like_matches_macro)]
+        #[allow(clippy::collapsible_match, clippy::match_like_matches_macro)]
         match self {
             AExpr::Function {
                 input, function, ..

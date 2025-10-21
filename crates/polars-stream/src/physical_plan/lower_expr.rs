@@ -136,6 +136,9 @@ pub fn is_input_independent_rec(
     }
 
     let ret = match arena.get(expr_key) {
+        // Handled separately in `Eval`.
+        AExpr::Element => unreachable!(),
+
         AExpr::Explode { expr: inner, .. }
         | AExpr::Cast {
             expr: inner,
@@ -280,6 +283,9 @@ pub fn is_length_preserving_rec(
     }
 
     let ret = match arena.get(expr_key) {
+        // Handled separately in `Eval`.
+        AExpr::Element => unreachable!(),
+
         AExpr::Gather { .. }
         | AExpr::Explode { .. }
         | AExpr::Filter { .. }
@@ -574,6 +580,9 @@ fn lower_exprs_with_ctx(
         }
 
         match ctx.expr_arena.get(expr).clone() {
+            // Handled separately in `Eval` expressions.
+            AExpr::Element => unreachable!(),
+
             AExpr::Explode {
                 expr: inner,
                 skip_empty,
@@ -1457,7 +1466,10 @@ fn lower_exprs_with_ctx(
                 evaluation,
                 variant,
             } => match variant {
-                EvalVariant::List | EvalVariant::Array { as_list: _ } => {
+                EvalVariant::List
+                | EvalVariant::ListAgg
+                | EvalVariant::Array { as_list: _ }
+                | EvalVariant::ArrayAgg => {
                     let (trans_input, trans_expr) = lower_exprs_with_ctx(input, &[inner], ctx)?;
                     let eval_expr = AExpr::Eval {
                         expr: trans_expr[0],
@@ -1649,6 +1661,7 @@ fn lower_exprs_with_ctx(
                 | IRAggExpr::Max { .. }
                 | IRAggExpr::First(_)
                 | IRAggExpr::Last(_)
+                | IRAggExpr::Item(_)
                 | IRAggExpr::Sum(_)
                 | IRAggExpr::Mean(_)
                 | IRAggExpr::Var { .. }

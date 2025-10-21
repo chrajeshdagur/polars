@@ -37,6 +37,7 @@ pub enum AggExpr {
     NUnique(Arc<Expr>),
     First(Arc<Expr>),
     Last(Arc<Expr>),
+    Item(Arc<Expr>),
     Mean(Arc<Expr>),
     Implode(Arc<Expr>),
     Count {
@@ -64,6 +65,7 @@ impl AsRef<Expr> for AggExpr {
             NUnique(e) => e,
             First(e) => e,
             Last(e) => e,
+            Item(e) => e,
             Mean(e) => e,
             Implode(e) => e,
             Count { input, .. } => input,
@@ -86,6 +88,10 @@ impl AsRef<Expr> for AggExpr {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "dsl-schema", derive(schemars::JsonSchema))]
 pub enum Expr {
+    /// Values in a `eval` context.
+    ///
+    /// Equivalent of `pl.element()`.
+    Element,
     Alias(Arc<Expr>, PlSmallStr),
     Column(PlSmallStr),
     Selector(Selector),
@@ -315,7 +321,7 @@ impl Hash for Expr {
                 returns_scalar.hash(state);
             },
             // already hashed by discriminant
-            Expr::Len => {},
+            Expr::Element | Expr::Len => {},
             Expr::SortBy {
                 expr,
                 by,
@@ -541,6 +547,8 @@ impl Expr {
 pub enum EvalVariant {
     /// `list.eval`
     List,
+    /// `list.agg`
+    ListAgg,
 
     /// `array.eval`
     Array {
@@ -548,6 +556,8 @@ pub enum EvalVariant {
         /// be `List`.
         as_list: bool,
     },
+    /// `arr.agg`
+    ArrayAgg,
 
     /// `cumulative_eval`
     Cumulative { min_samples: usize },
@@ -557,7 +567,9 @@ impl EvalVariant {
     pub fn to_name(&self) -> &'static str {
         match self {
             Self::List => "list.eval",
+            Self::ListAgg => "list.agg",
             Self::Array { .. } => "array.eval",
+            Self::ArrayAgg => "array.agg",
             Self::Cumulative { min_samples: _ } => "cumulative_eval",
         }
     }
@@ -565,9 +577,9 @@ impl EvalVariant {
     /// Get the `DataType` of the `pl.element()` value.
     pub fn element_dtype<'a>(&self, dtype: &'a DataType) -> PolarsResult<&'a DataType> {
         match (self, dtype) {
-            (Self::List, DataType::List(inner)) => Ok(inner.as_ref()),
+            (Self::List | Self::ListAgg, DataType::List(inner)) => Ok(inner.as_ref()),
             #[cfg(feature = "dtype-array")]
-            (Self::Array { .. }, DataType::Array(inner, _)) => Ok(inner.as_ref()),
+            (Self::Array { .. } | Self::ArrayAgg, DataType::Array(inner, _)) => Ok(inner.as_ref()),
             (Self::Cumulative { min_samples: _ }, dt) => Ok(dt),
             _ => polars_bail!(op = self.to_name(), dtype),
         }
@@ -578,9 +590,17 @@ impl EvalVariant {
         &self,
         dtype: &'_ DataType,
         output_element_dtype: DataType,
+        eval_is_scalar: bool,
     ) -> PolarsResult<DataType> {
         match (self, dtype) {
             (Self::List, DataType::List(_)) => Ok(DataType::List(Box::new(output_element_dtype))),
+            (Self::ListAgg, DataType::List(_)) => {
+                if eval_is_scalar {
+                    Ok(output_element_dtype)
+                } else {
+                    Ok(DataType::List(Box::new(output_element_dtype)))
+                }
+            },
             #[cfg(feature = "dtype-array")]
             (Self::Array { as_list: false }, DataType::Array(_, width)) => {
                 Ok(DataType::Array(Box::new(output_element_dtype), *width))
@@ -589,6 +609,14 @@ impl EvalVariant {
             (Self::Array { as_list: true }, DataType::Array(_, _)) => {
                 Ok(DataType::List(Box::new(output_element_dtype)))
             },
+            #[cfg(feature = "dtype-array")]
+            (Self::ArrayAgg, DataType::Array(_, _)) => {
+                if eval_is_scalar {
+                    Ok(output_element_dtype)
+                } else {
+                    Ok(DataType::List(Box::new(output_element_dtype)))
+                }
+            },
             (Self::Cumulative { min_samples: _ }, _) => Ok(output_element_dtype),
             _ => polars_bail!(op = self.to_name(), dtype),
         }
@@ -596,23 +624,27 @@ impl EvalVariant {
 
     pub fn is_elementwise(&self) -> bool {
         match self {
-            EvalVariant::List => true,
-            EvalVariant::Array { .. } => true,
+            EvalVariant::List | EvalVariant::ListAgg => true,
+            EvalVariant::Array { .. } | EvalVariant::ArrayAgg => true,
             EvalVariant::Cumulative { min_samples: _ } => false,
         }
     }
 
     pub fn is_row_separable(&self) -> bool {
         match self {
-            EvalVariant::List => true,
-            EvalVariant::Array { .. } => true,
+            EvalVariant::List | EvalVariant::ListAgg => true,
+            EvalVariant::Array { .. } | EvalVariant::ArrayAgg => true,
             EvalVariant::Cumulative { min_samples: _ } => false,
         }
     }
 
     pub fn is_length_preserving(&self) -> bool {
         match self {
-            EvalVariant::List | EvalVariant::Array { .. } | EvalVariant::Cumulative { .. } => true,
+            EvalVariant::List
+            | EvalVariant::ListAgg
+            | EvalVariant::Array { .. }
+            | EvalVariant::ArrayAgg
+            | EvalVariant::Cumulative { .. } => true,
         }
     }
 }

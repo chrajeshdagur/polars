@@ -338,6 +338,7 @@ impl Display for ExprIRDisplay<'_> {
 
         use AExpr::*;
         match root {
+            Element => f.write_str("element()"),
             Window {
                 function,
                 partition_by,
@@ -451,6 +452,7 @@ impl Display for ExprIRDisplay<'_> {
                     Mean(expr) => write!(f, "{}.mean()", self.with_root(expr)),
                     First(expr) => write!(f, "{}.first()", self.with_root(expr)),
                     Last(expr) => write!(f, "{}.last()", self.with_root(expr)),
+                    Item(expr) => write!(f, "{}.item()", self.with_root(expr)),
                     Implode(expr) => write!(f, "{}.implode()", self.with_root(expr)),
                     NUnique(expr) => write!(f, "{}.n_unique()", self.with_root(expr)),
                     Sum(expr) => write!(f, "{}.sum()", self.with_root(expr)),
@@ -529,12 +531,14 @@ impl Display for ExprIRDisplay<'_> {
                 let evaluation = self.with_root(evaluation);
                 match variant {
                     EvalVariant::List => write!(f, "{expr}.list.eval({evaluation})"),
+                    EvalVariant::ListAgg => write!(f, "{expr}.list.agg({evaluation})"),
                     EvalVariant::Array { as_list: false } => {
                         write!(f, "{expr}.array.eval({evaluation})")
                     },
                     EvalVariant::Array { as_list: true } => {
                         write!(f, "{expr}.array.eval({evaluation}, as_list=true)")
                     },
+                    EvalVariant::ArrayAgg => write!(f, "{expr}.array.agg({evaluation})"),
                     EvalVariant::Cumulative { min_samples } => write!(
                         f,
                         "{expr}.cumulative_eval({evaluation}, min_samples={min_samples})"

@@ -32,6 +32,7 @@ use super::{PhysNode, PhysNodeKey, PhysNodeKind, PhysStream};
 use crate::nodes::io_sources::multi_scan;
 use crate::nodes::io_sources::multi_scan::components::forbid_extra_columns::ForbidExtraColumns;
 use crate::nodes::io_sources::multi_scan::components::projection::builder::ProjectionBuilder;
+use crate::nodes::io_sources::multi_scan::components::row_counter::RowCounter;
 use crate::nodes::io_sources::multi_scan::reader_interface::builder::FileReaderBuilder;
 use crate::physical_plan::lower_expr::{ExprCache, build_select_stream, lower_exprs};
 use crate::physical_plan::lower_group_by::build_group_by_stream;
@@ -612,7 +613,7 @@ pub fn lower_ir(
                     .is_some_and(|slice| slice.len() == 0)
             {
                 if config::verbose() {
-                    eprintln!("lower_ir: scan IR had empty sources")
+                    eprintln!("lower_ir: scan IR lowered as empty InMemorySource")
                 }
 
                 // If there are no sources, just provide an empty in-memory source with the right
@@ -620,8 +621,30 @@ pub fn lower_ir(
                 PhysNodeKind::InMemorySource {
                     df: Arc::new(DataFrame::empty_with_schema(output_schema.as_ref())),
                 }
+            } else if output_schema.is_empty()
+                && let Some((physical_rows, deleted_rows)) = unified_scan_args.row_count
+            {
+                // Fast-count for scan_iceberg will hit here.
+
+                // Note: These are currently always `None`, as projection pushdown runs before slice /
+                // predicate pushdown.
+                assert!(unified_scan_args.pre_slice.is_none() && predicate.is_none());
+
+                let row_counter = RowCounter::new(physical_rows, deleted_rows);
+                let num_rows = row_counter.num_rows()?;
+
+                if config::verbose() {
+                    eprintln!(
+                        "lower_ir: scan IR lowered as 0-width InMemorySource with height {} ({:?})",
+                        num_rows, &row_counter
+                    )
+                }
+
+                PhysNodeKind::InMemorySource {
+                    df: Arc::new(DataFrame::empty_with_height(num_rows)),
+                }
             } else {
-                let file_reader_builder = match &*scan_type {
+                let file_reader_builder: Arc<dyn FileReaderBuilder> = match &*scan_type {
                     #[cfg(feature = "parquet")]
                     FileScanIR::Parquet {
                         options,
@@ -631,7 +654,7 @@ pub fn lower_ir(
                             options: Arc::new(options.clone()),
                             first_metadata: first_metadata.clone(),
                         },
-                    ) as Arc<dyn FileReaderBuilder>,
+                    ) as _,
 
                     #[cfg(feature = "ipc")]
                     FileScanIR::Ipc {
@@ -639,17 +662,13 @@ pub fn lower_ir(
                         metadata: first_metadata,
                     } => Arc::new(crate::nodes::io_sources::ipc::builder::IpcReaderBuilder {
                         first_metadata: first_metadata.clone(),
-                    }) as Arc<dyn FileReaderBuilder>,
+                    }) as _,
 
                     #[cfg(feature = "csv")]
-                    FileScanIR::Csv { options } => {
-                        Arc::new(Arc::new(options.clone())) as Arc<dyn FileReaderBuilder>
-                    },
+                    FileScanIR::Csv { options } => Arc::new(Arc::new(options.clone())) as _,
 
                     #[cfg(feature = "json")]
-                    FileScanIR::NDJson { options } => {
-                        Arc::new(Arc::new(options.clone())) as Arc<dyn FileReaderBuilder>
-                    },
+                    FileScanIR::NDJson { options } => Arc::new(Arc::new(options.clone())) as _,
 
                     #[cfg(feature = "python")]
                     FileScanIR::PythonDataset {
@@ -1092,7 +1111,7 @@ pub fn lower_ir(
                     distinct_lp_node,
                     &mut lp_arena,
                     expr_arena,
-                    None,
+                    Some(crate::dispatch::build_streaming_query_executor),
                 )?);
 
                 let format_str = ctx.prepare_visualization.then(|| {

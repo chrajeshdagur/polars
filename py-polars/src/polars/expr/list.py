@@ -8,6 +8,7 @@ import polars._reexport as pl
 from polars import exceptions
 from polars import functions as F
 from polars._utils.parse import parse_into_expression
+from polars._utils.unstable import unstable
 from polars._utils.various import issue_warning
 from polars._utils.wrap import wrap_expr
 
@@ -683,6 +684,39 @@ class ExprListNameSpace:
         """
         return self.get(-1, null_on_oob=True)
 
+    @unstable()
+    def item(self) -> Expr:
+        """
+        Get the single value of the sublists.
+
+        This errors if the sublist length is not exactly one.
+
+        See Also
+        --------
+        :meth:`Expr.list.get` : Get the value by index in the sublists.
+
+        Examples
+        --------
+        >>> df = pl.DataFrame({"a": [[3], [1], [2]]})
+        >>> df.with_columns(item=pl.col("a").list.item())
+        shape: (3, 2)
+        ┌───────────┬──────┐
+        │ a         ┆ item │
+        │ ---       ┆ ---  │
+        │ list[i64] ┆ i64  │
+        ╞═══════════╪══════╡
+        │ [3]       ┆ 3    │
+        │ [1]       ┆ 1    │
+        │ [2]       ┆ 2    │
+        └───────────┴──────┘
+        >>> df = pl.DataFrame({"a": [[3, 2, 1], [1], [2]]})
+        >>> df.select(pl.col("a").list.item())
+        Traceback (most recent call last):
+        ...
+        polars.exceptions.ComputeError: aggregation 'item' expected a single value, got 3 values
+        """  # noqa: W505
+        return self.agg(F.element().item())
+
     def contains(self, item: IntoExpr, *, nulls_equal: bool = True) -> Expr:
         """
         Check if sublists contain the given item.
@@ -1126,10 +1160,10 @@ class ExprListNameSpace:
             times, so the caller must provide an upper bound of the number of struct
             fields that will be created if `fields` is not a sequence of field names.
 
-        .. versionchanged: 1.33.0
-            The `n_field_strategy` parameter is ignored and deprecated. The `fields`
-            needs to be a sequence of field names or the upper bound is regarded as
-            ground truth.
+            .. versionchanged:: 1.33.0
+                The `n_field_strategy` parameter is ignored and deprecated. The `fields`
+                needs to be a sequence of field names or the upper bound is regarded as
+                ground truth.
 
         Examples
         --------
@@ -1189,8 +1223,7 @@ class ExprListNameSpace:
         Parameters
         ----------
         expr
-            Expression to run. Note that you can select an element with `pl.first()`, or
-            `pl.col()`
+            Expression to run. Note that you can select an element with `pl.element()`.
         parallel
             Run all expression parallel. Don't activate this blindly.
             Parallelism is worth it if there is enough work to do per thread.
@@ -1214,8 +1247,55 @@ class ExprListNameSpace:
         │ 8   ┆ 5   ┆ [2.0, 1.0] │
         │ 3   ┆ 2   ┆ [2.0, 1.0] │
         └─────┴─────┴────────────┘
+
+        See Also
+        --------
+        polars.Expr.list.agg: Evaluate any expression and automatically explode.
+        polars.Expr.arr.eval: Same for the Array datatype.
         """
         return wrap_expr(self._pyexpr.list_eval(expr._pyexpr, parallel))
+
+    def agg(self, expr: Expr) -> Expr:
+        """
+        Run any polars aggregation expression against the lists' elements.
+
+        Parameters
+        ----------
+        expr
+            Expression to run. Note that you can select an element with `pl.element()`.
+
+        Examples
+        --------
+        >>> df = pl.DataFrame({"a": [[1, None], [42, 13], [None, None]]})
+        >>> df.with_columns(null_count=pl.col.a.list.agg(pl.element().null_count()))
+        shape: (3, 2)
+        ┌──────────────┬────────────┐
+        │ a            ┆ null_count │
+        │ ---          ┆ ---        │
+        │ list[i64]    ┆ u32        │
+        ╞══════════════╪════════════╡
+        │ [1, null]    ┆ 1          │
+        │ [42, 13]     ┆ 0          │
+        │ [null, null] ┆ 2          │
+        └──────────────┴────────────┘
+        >>> df.with_columns(no_nulls=pl.col.a.list.agg(pl.element().drop_nulls()))
+        shape: (3, 2)
+        ┌──────────────┬───────────┐
+        │ a            ┆ no_nulls  │
+        │ ---          ┆ ---       │
+        │ list[i64]    ┆ list[i64] │
+        ╞══════════════╪═══════════╡
+        │ [1, null]    ┆ [1]       │
+        │ [42, 13]     ┆ [42, 13]  │
+        │ [null, null] ┆ []        │
+        └──────────────┴───────────┘
+
+        See Also
+        --------
+        polars.Expr.list.eval: Evaluates expressions without automatically exploding.
+        polars.Expr.arr.agg: Same for the Array datatype.
+        """
+        return wrap_expr(self._pyexpr.list_agg(expr._pyexpr))
 
     def filter(self, predicate: Expr) -> Expr:
         """
