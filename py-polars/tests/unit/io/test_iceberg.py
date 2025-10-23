@@ -6,6 +6,7 @@ import itertools
 import os
 import pickle
 import sys
+import warnings
 import zoneinfo
 from datetime import date, datetime
 from decimal import Decimal as D
@@ -14,10 +15,9 @@ from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pydantic
 import pyiceberg
 import pytest
-from pyiceberg.catalog.sql import SqlCatalog
-from pyiceberg.io.pyarrow import schema_to_pyarrow
 from pyiceberg.partitioning import (
     BucketTransform,
     IdentityTransform,
@@ -51,6 +51,12 @@ from polars._utils.various import parse_version
 from polars.io.iceberg._utils import _convert_predicate, _to_ast
 from polars.io.iceberg.dataset import IcebergDataset, _NativeIcebergScanData
 from polars.testing import assert_frame_equal
+
+with warnings.catch_warnings():
+    # Upstream issue at https://github.com/apache/iceberg-python/issues/2648
+    warnings.simplefilter("ignore", pydantic.warnings.PydanticDeprecatedSince212)
+    from pyiceberg.catalog.sql import SqlCatalog
+    from pyiceberg.io.pyarrow import schema_to_pyarrow
 
 
 @pytest.fixture
@@ -1208,10 +1214,8 @@ def test_scan_iceberg_parquet_prefilter_with_column_mapping(
     )
 
     # First file
-    assert (
-        "[MultiScan]: Source filter mask initialization via table statistics" in capture
-    )
-    assert "[MultiScan]: Predicate pushdown allows skipping 1 / 2 files" in capture
+    assert "Source filter mask initialization via table statistics" in capture
+    assert "Predicate pushdown allows skipping 1 / 2 files" in capture
     # Second file
     assert (
         "[ParquetFileReader]: Predicate pushdown: reading 1 / 1 row groups" in capture
@@ -1811,8 +1815,7 @@ def test_scan_iceberg_min_max_statistics_filter(
             capture = capfd.readouterr().err
 
             if "iceberg_table_filter: Some(<redacted>)" in capture:
-                assert "scan IR lowered as empty InMemorySource" in capture
-                assert "[MultiScan]: " not in capture
+                assert "apply_scan_predicate_to_scan_ir: remove 0 / 0 files" in capture
 
                 # Scanning with pyiceberg can also skip the file if the predicate
                 # can be converted.
@@ -1825,7 +1828,7 @@ def test_scan_iceberg_min_max_statistics_filter(
 
                 iceberg_table_filter_seen = True
             else:
-                assert "[MultiScan]: " in capture
+                assert "apply_scan_predicate_to_scan_ir: remove 1 / 1 file" in capture
 
             capfd.readouterr()
 
