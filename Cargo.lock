@@ -3635,6 +3635,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "polars-arrow",
+ "polars-compute",
  "polars-core",
  "polars-error",
  "polars-expr",
@@ -3831,7 +3832,7 @@ dependencies = [
 
 [[package]]
 name = "py-polars"
-version = "1.35.0"
+version = "1.35.1"
 dependencies = [
  "either",
  "libc",

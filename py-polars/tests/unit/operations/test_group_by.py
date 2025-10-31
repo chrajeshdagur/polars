@@ -1920,3 +1920,66 @@ def test_group_by_skew_kurtosis(s: pl.Series) -> None:
         [pl.col.f.list.agg(e(pl.element())).alias(n) for n, e in exprs.items()]
     )
     assert_frame_equal(sl, li)
+
+
+def test_group_by_rolling_fill_null_25036() -> None:
+    frame = pl.DataFrame(
+        {
+            "date": [date(2013, 1, 1), date(2013, 1, 2), date(2013, 1, 3)] * 2,
+            "group": ["A"] * 3 + ["B"] * 3,
+            "value": [None, None, 3, 4, None, None],
+        }
+    )
+    result = frame.rolling(index_column="date", period="2d", group_by="group").agg(
+        pl.col("value").forward_fill(limit=None).last()
+    )
+
+    expected = pl.DataFrame(
+        {
+            "group": ["A"] * 3 + ["B"] * 3,
+            "date": [date(2013, 1, 1), date(2013, 1, 2), date(2013, 1, 3)] * 2,
+            "value": [None, None, 3, 4, 4, None],
+        }
+    )
+
+    assert_frame_equal(result, expected)
+
+
+exprs = [
+    pl.col.a,
+    pl.col.a.filter(pl.col.a <= 1),
+    pl.col.a.first(),
+    pl.lit(1).alias("one"),
+    pl.lit(pl.Series([1])),
+]
+
+
+@pytest.mark.parametrize("lhs", exprs)
+@pytest.mark.parametrize("rhs", exprs)
+@pytest.mark.parametrize("op", [pl.Expr.add, pl.Expr.pow])
+def test_group_broadcast_binary_apply_expr_25046(
+    lhs: pl.Expr, rhs: pl.Expr, op: Any
+) -> None:
+    df = pl.DataFrame({"g": [10, 10, 20], "a": [1, 2, 3]})
+    groups = pl.lit(1)
+    out = df.group_by(groups).agg((op(lhs, rhs)).implode()).to_series(1)
+    expected = df.select((op(lhs, rhs)).implode()).to_series()
+    assert_series_equal(out, expected)
+
+
+def test_group_by_explode_none_dtype_25045() -> None:
+    df = pl.DataFrame({"a": [None, None, None], "b": [1.0, 2.0, None]})
+    out_a = df.group_by(pl.lit(1)).agg(pl.col.a.explode())
+    expected_a = pl.DataFrame({"literal": 1, "a": [[None, None, None]]})
+    assert_frame_equal(out_a, expected_a)
+
+    out_b = df.group_by(pl.lit(1)).agg(pl.col.b.explode())
+    assert len(out_a["a"][0]) == len(out_b["b"][0])
+
+    out_c = df.select(
+        pl.coalesce(pl.col.a.explode(), pl.col.b.explode())
+        .implode()
+        .over(pl.int_range(pl.len()))
+    )
+    expected_c = pl.DataFrame({"a": [[1.0], [2.0], [None]]})
+    assert_frame_equal(out_c, expected_c)

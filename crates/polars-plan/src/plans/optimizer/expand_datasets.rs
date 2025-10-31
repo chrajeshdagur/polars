@@ -270,7 +270,7 @@ pub(super) fn expand_datasets(
 
                         *sources = resolved_sources.clone();
 
-                        *scan_type = Box::new(match *resolved_scan_type.clone() {
+                        **scan_type = match *resolved_scan_type.clone() {
                             #[cfg(feature = "csv")]
                             FileScanDsl::Csv { options } => FileScanIR::Csv { options },
 
@@ -297,12 +297,15 @@ pub(super) fn expand_datasets(
                                 }
                             },
 
+                            #[cfg(feature = "scan_lines")]
+                            FileScanDsl::Lines { name } => FileScanIR::Lines { name },
+
                             FileScanDsl::Anonymous {
                                 options,
                                 function,
                                 file_info: _,
                             } => FileScanIR::Anonymous { options, function },
-                        });
+                        };
                     },
 
                     DslPlan::PythonScan { options } => {

@@ -36,6 +36,7 @@ slotmap = { workspace = true }
 strum_macros = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["sync"] }
 
+polars-compute = { workspace = true }
 polars-core = { workspace = true, features = ["partition_by"] }
 polars-error = { workspace = true }
 polars-expr = { workspace = true, features = ["rle", "peaks", "arg_where", "unique_counts", "dtype-struct"] }
@@ -62,6 +63,7 @@ ipc = ["polars-mem-engine/ipc", "polars-plan/ipc", "polars-io/ipc"]
 parquet = ["polars-mem-engine/parquet", "polars-plan/parquet", "cloud"]
 csv = ["polars-mem-engine/csv", "polars-plan/csv", "polars-io/csv"]
 json = ["polars-mem-engine/json", "polars-plan/json", "polars-io/json"]
+scan_lines = ["polars-mem-engine/scan_lines", "polars-plan/scan_lines", "polars-io/scan_lines"]
 cloud = ["polars-mem-engine/cloud", "polars-plan/cloud", "polars-io/cloud"]
 diff = ["polars-ops/diff", "polars-plan/diff", "polars-plan/abs"]
 dtype-array = ["polars-core/dtype-array"]
