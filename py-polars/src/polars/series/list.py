@@ -195,6 +195,27 @@ class ListNameSpace:
         ]
         """
 
+    def product(self) -> Series:
+        """
+        Product of all the arrays in the list.
+
+        Notes
+        -----
+        If there are no non-null elements in a row, the output is `1`.
+
+        Examples
+        --------
+        >>> s = pl.Series("values", [[1], [2, 3]])
+        >>> s.list.product()
+        shape: (2,)
+        Series: 'values' [i64]
+        [
+            1
+            6
+        ]
+        """
+        ...
+
     def max(self) -> Series:
         """
         Compute the max value of the arrays in the list.
