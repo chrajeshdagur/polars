@@ -1266,3 +1266,9 @@ def test_list_df_invalid_type_in_planner() -> None:
 
     with pytest.raises(pl.exceptions.InvalidOperationError):
         q.collect_schema()
+
+
+def test_list_product_simple() -> None:
+    s = pl.Series([[1, 2, 3], [4, 5, 6]])
+    # Series.list.product should compute product per list
+    assert s.list.product().to_list() == [6, 120]
